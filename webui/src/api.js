@@ -84,12 +84,9 @@ export async function getHealth() {
   return handle(await fetch(`${base}/health`));
 }
 
-// Resolve the app version from the backend health payload, falling back to the
-// version declared in package.json so the UI still shows a value before the
-// backend responds (or if the endpoint is unavailable).
-export const APP_VERSION =
-  JSON.parse(import.meta.env.VITE_APP_VERSION_JSON || "null")?.version ||
-  "0.0.1";
+// Web UI version, injected at build time from package.json. Kept independent
+// of the backend version surfaced via /api/health.
+export const WEBUI_VERSION = import.meta.env.WEBUI_VERSION || "0.0.1";
 
 // ── Auth ──────────────────────────────────────────────────────────────
 export async function register(username, password) {
