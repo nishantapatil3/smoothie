@@ -1,0 +1,65 @@
+# Smoothie backend configuration (config.yaml)
+#
+# This is the single source of truth for backend settings. Copy it to
+# `config.yaml` (same directory) and adjust. The web UI Settings page edits
+# these values at runtime and writes them back here.
+#
+# `data_dir`, `ffmpeg_bin`, and `auth_secret` are NOT exposed in the UI:
+#   - data_dir / ffmpeg_bin affect where the live database lives.
+#   - auth_secret signs tokens; set it here to a stable random value
+#     (e.g. output of `openssl rand -hex 32`) so tokens survive restarts.
+
+# --- Server ---
+host: 0.0.0.0
+port: 5173
+
+# --- Storage ---
+# Directory where the sqlite db and uploaded audio live.
+data_dir: data
+
+# --- Transcription provider (MLX Whisper, local) ---
+transcription_model: mlx-community/whisper-large-v3-mlx
+# Force a language, or empty/null for auto-detect (e.g. "en").
+transcription_language: en
+
+# --- VAD-based chunking (long audio) ---
+vad_enabled: true
+vad_threshold: 0.5
+vad_min_speech_ms: 250
+vad_min_silence_ms: 400
+vad_speech_pad_ms: 200
+vad_chunk_target_sec: 24
+vad_chunk_max_sec: 30
+
+# --- Summary provider (OpenAI-compatible /chat/completions endpoint) ---
+# Point at any summarizer LLM — local or remote. Default is a local
+# OpenAI-compatible server (e.g. Ollama at its /v1 port).
+summary_url: http://localhost:11434/v1
+# Optional bearer token; leave empty for local/keyless endpoints.
+summary_key: ""
+summary_model: llama3.2
+
+# --- Worker ---
+job_poll_interval: 2.0
+
+# --- Auth ---
+# Secret signing Bearer access tokens (HMAC). Set a stable random value.
+auth_secret: ""
+auth_access_ttl_minutes: 60
+auth_refresh_ttl_days: 7
+auth_min_password_len: 8
+
+# --- Pre-audio-processing (pluggable modules) ---
+ffmpeg_bin: ""  # auto-detected via shutil.which if empty
+
+# trim: remove silence before transcription (conservative defaults).
+trim_enabled: false
+trim_threshold: -40
+trim_min_silence: 0.5
+
+# tune: surface Whisper decode options. Empty/null = Whisper default.
+tune_enabled: true
+tune_beam_size: null
+tune_condition_on_previous_text: null
+tune_no_speech_threshold: null
+tune_hallucination_silence_threshold: 2.0

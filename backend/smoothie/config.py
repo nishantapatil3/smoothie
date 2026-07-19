@@ -1,30 +1,45 @@
-"""Application configuration loaded from environment variables.
+"""Application configuration loaded from ``config.yaml``.
 
-All settings can be overridden with environment variables or a `.env` file.
+``config.yaml`` (in the backend root) is the single source of truth. If it is
+missing, built-in defaults are used and the file is written on first save. No
+environment variables or ``.env`` files are consulted. The running server's
+settings can be updated at runtime via :func:`apply_settings` (persisted back to
+``config.yaml``), so the web UI's Settings page can edit them live.
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger("smoothie")
 
 # Project root: backend/ (this file lives in backend/smoothie/)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = BACKEND_ROOT / "data"
 
+# config.yaml lives in the backend root. Secrets (summary_key, auth_secret) may
+# be written here, so it should be git-ignored.
+CONFIG_PATH = BACKEND_ROOT / "config.yaml"
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="SMOOTHIE_", env_file=str(BACKEND_ROOT / ".env"), extra="ignore"
-    )
+# Settings the web UI is not allowed to read or write (secret / DB-stability).
+HIDDEN_SETTINGS = {"auth_secret", "data_dir", "ffmpeg_bin"}
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
     # --- Server ---
     host: str = "0.0.0.0"
     port: int = 5173
 
     # --- Storage ---
-    # Directory where the sqlite db and uploaded audio live.
+    # Directory where the sqlite db and uploaded audio live. Not user-editable
+    # via the UI (changing it mid-run would orphan the live database).
     data_dir: Path = DATA_DIR
 
     # --- Transcription provider (MLX Whisper) ---
@@ -64,6 +79,20 @@ class Settings(BaseSettings):
     # Polling interval (seconds) for the background job loop.
     job_poll_interval: float = 2.0
 
+    # --- Auth ---
+    # Secret used to sign stateless Bearer access tokens (HMAC-SHA256). Generate
+    # a strong random value and keep it stable across restarts, or existing
+    # tokens become invalid on every boot. If left empty, an ephemeral secret is
+    # generated at startup (tokens won't survive a restart). Not exposed via the
+    # UI for safety — set it in config.yaml directly.
+    auth_secret: str = ""
+    # Access token lifetime in minutes (short-lived; refreshed silently).
+    auth_access_ttl_minutes: int = 60
+    # Refresh token lifetime in days (long-lived; rotated on each use).
+    auth_refresh_ttl_days: int = 7
+    # Minimum accepted password length at registration.
+    auth_min_password_len: int = 8
+
     # --- Pre-audio-processing (pluggable modules) ---
     # Modules run before transcription. Each is independently enable/disable-able.
     # See smoothie/preprocess/ for the module implementations.
@@ -98,6 +127,57 @@ class Settings(BaseSettings):
         return path
 
 
+def load_config() -> Settings:
+    """Load settings from ``config.yaml``; fall back to defaults if absent."""
+    if not CONFIG_PATH.exists():
+        return Settings()
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            logger.warning("config.yaml is not a mapping; using defaults.")
+            return Settings()
+        # Drop keys the UI must not inject; pydantic extra="ignore" also covers
+        # unknown keys defensively.
+        data = {k: v for k, v in data.items() if k not in HIDDEN_SETTINGS}
+        return Settings(**data)
+    except Exception as exc:  # noqa: BLE001 - never let a bad file crash startup
+        logger.warning("Failed to read config.yaml (%s); using defaults.", exc)
+        return Settings()
+
+
+def save_config(settings: Settings) -> None:
+    """Persist ``settings`` to ``config.yaml`` (hidden fields excluded)."""
+    payload = settings.model_dump()
+    payload = {k: v for k, v in payload.items() if k not in HIDDEN_SETTINGS}
+    with CONFIG_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return load_config()
+
+
+def apply_settings(updates: dict[str, Any]) -> Settings:
+    """Update the cached settings in place, persist to ``config.yaml``, return it.
+
+    ``updates`` is a partial dict of editable fields. Hidden fields
+    (``auth_secret``, ``data_dir``, ``ffmpeg_bin``) and any unknown keys are
+    ignored. Values are validated/coerced by the ``Settings`` model so e.g. a
+    JSON boolean becomes a real ``bool``. Raises ``ValueError`` on invalid data.
+    """
+    settings = get_settings()
+    current = settings.model_dump()
+    for key, value in updates.items():
+        if key in HIDDEN_SETTINGS or key not in current:
+            continue
+        current[key] = value
+    # Re-validate the merged result (coerces types, rejects bad ones).
+    updated = Settings(**current)
+    # Mutate the cached singleton in place so existing get_settings() callers
+    # see the new values immediately.
+    for key, value in updated.model_dump().items():
+        setattr(settings, key, value)
+    save_config(settings)
+    return settings

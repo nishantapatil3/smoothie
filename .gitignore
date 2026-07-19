@@ -18,9 +18,11 @@ htmlcov/
 backend/data/
 
 # Env / secrets
-.env
-.env.*
-!.env.example
+# config.yaml holds runtime settings + secrets (summary_key, auth_secret).
+# The example template is committed; the real file is git-ignored.
+config.yaml
+config.yaml.*
+!config.yaml.example
 
 # Node / webui
 webui/node_modules/
