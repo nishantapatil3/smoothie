@@ -15,6 +15,7 @@ from .config import get_settings
 from . import admin_api, auth, settings_api, transcription
 from .db import get_session, init_db
 from .models import Job, JobStage, Recording, User
+from .tiers import UNLIMITED, can_transcribe
 from .schemas import (
     HealthOut,
     RecordingDetail,
@@ -22,7 +23,7 @@ from .schemas import (
     SegmentOut,
 )
 from .auth import get_current_user
-from .storage import audio_path, delete_audio, save_audio
+from .storage import audio_duration_sec, audio_path, delete_audio, save_audio
 from .tasks import reprocess, retry_summary, start_worker, stop_worker
 
 logger = logging.getLogger("smoothie")
@@ -96,7 +97,29 @@ async def create_recording(
     if not data:
         raise HTTPException(status_code=400, detail="Empty audio file.")
 
-    filename, _ = save_audio(data, audio.content_type)
+    filename, abs_path = save_audio(data, audio.content_type)
+
+    # Reject uploads that exceed the user's remaining transcription budget
+    # before they are queued (the worker also enforces the cap, but this gives
+    # immediate feedback and avoids a doomed job). Unlimited tiers skip this.
+    _, _, limit = can_transcribe(user.tier, float(user.usage_minutes))
+    if limit is not UNLIMITED:
+        duration = audio_duration_sec(abs_path)
+        if duration is not None:
+            # limit/usage_minutes are in minutes; duration is in seconds.
+            remaining_min = max(0.0, limit - float(user.usage_minutes))
+            duration_min = duration / 60.0
+            if duration_min > remaining_min:
+                delete_audio(filename)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This audio is {duration_min:.1f} min but you have "
+                        f"{remaining_min:.1f} min of transcription remaining on "
+                        f"the {user.tier} tier. Upgrade or trim the clip to "
+                        "continue."
+                    ),
+                )
 
     recording = Recording(
         user_id=user.id,

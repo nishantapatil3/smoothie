@@ -142,6 +142,17 @@ export default function TranscriptView({ id, onDeleted }) {
               <p>{rec.full_text}</p>
             )}
           </div>
+        ) : rec.status === "failed" ? (
+          /limit/i.test(rec.error || "") ? (
+            <div className="error box" style={{ marginTop: 0 }}>
+              Transcription limit reached. Free tier allows 30 minutes of
+              transcription — upgrade to Standard or Pro to continue.
+            </div>
+          ) : (
+            <p className="muted">
+              Transcription failed{rec.error ? `: ${rec.error}` : ""}.
+            </p>
+          )
         ) : (
           <p className="muted">Waiting for transcription…</p>
         )}

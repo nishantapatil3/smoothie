@@ -1,6 +1,8 @@
 """Audio file storage on local disk."""
 from __future__ import annotations
 
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -26,6 +28,37 @@ def delete_audio(filename: str) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def audio_duration_sec(path: str | Path) -> float | None:
+    """Return audio duration in seconds via ffprobe, else None.
+
+    Used to reject uploads longer than a user's remaining transcription budget
+    before they are queued. Returns ``None`` when ffmpeg/ffprobe is missing or
+    the probe fails, so callers can treat an unknown duration as "don't block"
+    rather than rejecting every upload.
+    """
+    ffprobe = get_settings().ffmpeg_bin or shutil.which("ffprobe")
+    ffprobe = ffprobe.replace("ffmpeg", "ffprobe") if ffprobe else None
+    if not ffprobe:
+        # Fall back to deriving ffprobe from an ffmpeg path, else give up.
+        ffmpeg = get_settings().ffmpeg_bin or shutil.which("ffmpeg")
+        if ffmpeg:
+            ffprobe = str(ffmpeg).replace("ffmpeg", "ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
 
 
 def _extension_for(content_type: str | None) -> str:

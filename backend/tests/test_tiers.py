@@ -344,3 +344,60 @@ def test_retry_summary_409_without_transcript(client):
         loop.close()
 
     assert res.status_code == 409
+
+
+# --- Upload gate: reject audio longer than remaining budget ----------------- #
+def test_upload_rejected_when_audio_exceeds_remaining(client):
+    """A free user with 1 min remaining can upload a short clip but not a clip
+    longer than their remaining budget (checked before queueing)."""
+    import subprocess
+    import asyncio
+
+    token = _register(client, "carol")["token"]
+    carol_id = client.get("/api/auth/me", headers=_auth_header(token)).json()["id"]
+
+    # Seed carol to 29 used min -> 1 min remaining on the free tier.
+    async def _seed():
+        from smoothie.models import User
+
+        async with db.async_session() as s:
+            u = await s.get(User, carol_id)
+            u.usage_minutes = 29
+            await s.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_seed())
+
+        def _make_wav(seconds: int, path: str) -> bytes:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i",
+                    f"anoisesrc=duration={seconds}:sample_rate=16000",
+                    "-t", str(seconds), path,
+                ],
+                check=True, capture_output=True,
+            )
+            return Path(path).read_bytes()
+
+        short = _make_wav(20, "/tmp/short.wav")
+        long = _make_wav(120, "/tmp/long.wav")
+
+        # Short clip (20s) fits in the 1-min remaining budget -> 201.
+        ok = client.post(
+            "/api/recordings",
+            headers=_auth_header(token),
+            files={"audio": ("short.wav", short, "audio/wav")},
+        )
+        assert ok.status_code == 201, ok.text
+
+        # Long clip (120s) exceeds the 1-min remaining budget -> 409.
+        big = client.post(
+            "/api/recordings",
+            headers=_auth_header(token),
+            files={"audio": ("long.wav", long, "audio/wav")},
+        )
+        assert big.status_code == 409
+        assert "remaining" in big.json()["detail"].lower()
+    finally:
+        loop.close()
