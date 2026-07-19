@@ -17,7 +17,6 @@ import mlx.core as mx
 import mlx_whisper
 import mlx_whisper.load_models as _load_models
 import numpy as np
-import tqdm
 from huggingface_hub import snapshot_download
 
 from .config import get_settings
@@ -49,35 +48,33 @@ class TranscriptionResult:
 _CHUNK_SECONDS = 30
 _CHUNK_OVERLAP_SECONDS = 1
 
-# Live transcription progress (0.0-1.0), captured from mlx_whisper's internal
-# frame progress bar. Single-worker app, so a module-level value is safe.
-_progress: dict = {"n": 0, "total": 0}
+# Live transcription progress (0.0-1.0), tracked per audio *segment* (a
+# transcription window / VAD chunk), not per decoder frame. Single-worker app,
+# so a module-level value is safe.
+_progress: dict = {"current": 0, "total": 0}
 
 
 def get_progress() -> float:
-    """Return current transcription progress as a fraction (0.0-1.0)."""
+    """Return transcription progress as a fraction (0.0-1.0).
+
+    Computed as ``current_segment / total_segments`` — i.e. how many of the
+    audio segments being transcribed have finished.
+    """
     total = _progress["total"]
     if not total:
         return 0.0
-    return min(1.0, _progress["n"] / total)
+    return min(1.0, _progress["current"] / total)
 
 
-def _install_progress_hook() -> None:
-    """Monkeypatch tqdm so each frame update records live progress.
+def _set_segment_total(n: int) -> None:
+    """Declare how many audio segments will be transcribed for this call."""
+    _progress["current"] = 0
+    _progress["total"] = n
 
-    mlx_whisper already iterates its decoder over audio frames with a tqdm
-    bar (when verbose is not True). By spying on ``update`` we capture the
-    real n/total without changing transcription speed or accuracy. The
-    original is restored by the caller.
-    """
-    orig_update = tqdm.tqdm.update
 
-    def _spy(self, n=1):
-        _progress["n"] = self.n
-        _progress["total"] = self.total
-        return orig_update(self, n)
-
-    tqdm.tqdm.update = _spy  # type: ignore[assignment]
+def _advance_segment() -> None:
+    """Mark one audio segment as transcribed."""
+    _progress["current"] += 1
 
 
 def _model_id() -> str:
@@ -165,11 +162,9 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
         logger.info("Loading Whisper model '%s' for this request.", model_id)
 
     processed_path = run_audio_transforms(path, settings)
-    # Capture live progress from mlx_whisper's frame bar during this call.
-    _progress["n"] = 0
-    _progress["total"] = 0
-    orig_update = tqdm.tqdm.update
-    _install_progress_hook()
+    # Reset segment-based progress for this call. The chunking helpers below
+    # declare the total and advance it per audio segment.
+    _set_segment_total(0)
     try:
         audio = _load_waveform(processed_path)
         if _needs_chunking(audio):
@@ -202,6 +197,7 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
                     audio, model_id, lang, collect_transcribe_options(settings)
                 )
         else:
+            _set_segment_total(1)
             result = mlx_whisper.transcribe(
                 processed_path,
                 path_or_hf_repo=model_id,
@@ -210,15 +206,12 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
                 verbose=False,
                 **collect_transcribe_options(settings),
             )
+            _advance_segment()
     finally:
-        # Capture the final progress before restoring/resetting, so the caller
-        # can record it.
+        # Capture the final progress (segment fraction) so the caller can
+        # record it, then clear it so a stale value isn't reported later.
         final_progress = get_progress()
-        # Restore the original tqdm and clear progress so a stale value isn't
-        # reported after transcription finishes.
-        tqdm.tqdm.update = orig_update  # type: ignore[assignment]
-        _progress["n"] = 0
-        _progress["total"] = 0
+        _set_segment_total(0)
         # Remove any temp file produced by the preprocessing chain, but never
         # the original uploaded audio.
         if processed_path != path and os.path.exists(processed_path):
@@ -293,6 +286,7 @@ def _transcribe_chunked(
     all_text: list[str] = []
     all_segments: list[dict] = []
     overlap_skip = float(_CHUNK_OVERLAP_SECONDS)
+    _set_segment_total(len(starts))
 
     for start in starts:
         window = audio[start : start + chunk_samples]
@@ -307,6 +301,7 @@ def _transcribe_chunked(
             condition_on_previous_text=False,
             **options,
         )
+        _advance_segment()
         offset = start / sr
         window_segments = [
             s for s in chunk_result.get("segments", []) if s.get("end", 0.0) > overlap_skip
@@ -390,6 +385,7 @@ def _transcribe_vad_chunks(
 
     all_text: list[str] = []
     all_segments: list[dict] = []
+    _set_segment_total(len(chunks))
 
     for start, end in chunks:
         window = np_audio[start:end]
@@ -404,6 +400,7 @@ def _transcribe_vad_chunks(
             condition_on_previous_text=False,
             **options,
         )
+        _advance_segment()
         offset = start / sr
         for seg in chunk_result.get("segments", []):
             all_segments.append(
