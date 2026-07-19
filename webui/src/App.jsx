@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getHealth, getMe, listRecordings, getToken, setTokens, clearTokens, logout } from "./api.js";
+import { getHealth, getMe, listRecordings, getToken, setTokens, clearTokens, logout, APP_VERSION } from "./api.js";
 import Login from "./components/Login.jsx";
 import Settings from "./components/Settings.jsx";
 import Recorder from "./components/Recorder.jsx";
@@ -84,6 +84,9 @@ export default function App() {
     <div className="app">
       <header>
         <h1>🥤 Smoothie</h1>
+        <span className="version-badge" title="Smoothie version">
+          v{health?.version ?? APP_VERSION}
+        </span>
         <span className="muted">
           local transcription &amp; summaries
           {health && (

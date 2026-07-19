@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .config import get_settings
+from . import __version__
 from . import admin_api, auth, settings_api, transcription
 from .db import get_session, init_db
 from .models import Job, JobStage, Recording, User
@@ -74,6 +75,7 @@ async def _shutdown() -> None:
 async def health() -> HealthOut:
     return HealthOut(
         status="ok",
+        version=__version__,
         transcription_model=settings.transcription_model,
         summary_url=settings.summary_url,
         summary_model=settings.summary_model,

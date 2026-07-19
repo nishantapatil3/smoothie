@@ -46,6 +46,7 @@ class RecordingDetail(RecordingListItem):
 
 class HealthOut(BaseModel):
     status: str
+    version: str
     transcription_model: str
     summary_url: str
     summary_model: str

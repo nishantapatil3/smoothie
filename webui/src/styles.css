@@ -23,6 +23,15 @@ body {
 
 header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
 header h1 { margin: 0; font-size: 24px; }
+.version-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #1a1a22;
+  color: var(--muted);
+}
 .header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .header-right .muted { font-size: 13px; }
 
