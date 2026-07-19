@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getSettings, saveSettings } from "../api.js";
+import { getSettings, saveSettings, listUsers, setUserTier } from "../api.js";
 
 // Editable config sections. `type` drives rendering; `hint` is helper text.
 // Fields whose value may be null (language, tune_*) use text/number inputs that
@@ -107,16 +107,30 @@ function Field({ field, value, onChange }) {
   );
 }
 
-export default function Settings() {
+export default function Settings({ me, onTierChanged }) {
   const [form, setForm] = useState(null);
   const [status, setStatus] = useState(null); // {type, msg}
   const [busy, setBusy] = useState(false);
+
+  // Admin-only: list of users to manage tiers, shown only to configured admins.
+  const [users, setUsers] = useState(null);
+  const [usersError, setUsersError] = useState(null);
+  const [tierBusy, setTierBusy] = useState(null); // userId being changed
+
+  const isAdmin = Boolean(me?.is_admin);
 
   useEffect(() => {
     getSettings()
       .then(setForm)
       .catch(() => setStatus({ type: "error", msg: "Failed to load settings." }));
   }, []);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    listUsers()
+      .then(setUsers)
+      .catch(() => setUsersError("Failed to load users."));
+  }, [isAdmin]);
 
   function setField(key, raw) {
     const field = SECTIONS.flatMap((s) => s.fields).find((f) => f.key === key);
@@ -175,6 +189,66 @@ export default function Settings() {
       <button className="btn primary" onClick={onSave} disabled={busy}>
         {busy ? "Saving…" : "Save settings"}
       </button>
+
+      {isAdmin && (
+        <div className="card settings-section users-panel">
+          <h3>Users &amp; Tiers</h3>
+          <p className="muted">
+            Set each user's subscription tier. Free users get 30 lifetime minutes
+            of transcription; Standard and Pro are unlimited.
+          </p>
+          {usersError && <div className="error">{usersError}</div>}
+          {users == null && !usersError && (
+            <div className="muted">Loading users…</div>
+          )}
+          {users && (
+            <table className="users-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Tier</th>
+                  <th>Usage (min)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr key={u.id}>
+                    <td>{u.username}</td>
+                    <td>
+                      <select
+                        value={u.tier}
+                        disabled={tierBusy === u.id}
+                        onChange={async (e) => {
+                          const tier = e.target.value;
+                          setTierBusy(u.id);
+                          try {
+                            const updated = await setUserTier(u.id, tier);
+                            setUsers((prev) =>
+                              prev.map((x) => (x.id === u.id ? updated : x))
+                            );
+                            if (me && u.id === me.id && onTierChanged) {
+                              onTierChanged(updated);
+                            }
+                          } catch {
+                            setUsersError("Failed to update tier.");
+                          } finally {
+                            setTierBusy(null);
+                          }
+                        }}
+                      >
+                        <option value="free">free</option>
+                        <option value="standard">standard</option>
+                        <option value="pro">pro</option>
+                      </select>
+                    </td>
+                    <td>{u.usage_minutes}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
     </div>
   );
 }

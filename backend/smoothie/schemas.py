@@ -28,6 +28,9 @@ class RecordingListItem(BaseModel):
     language: str | None
     duration_sec: float | None
     created_at: datetime
+    # Transcription progress as a fraction (0.0-1.0); meaningful while the
+    # recording is being transcribed. Included so the sidebar can show a bar.
+    progress: float = 0.0
 
 
 class RecordingDetail(RecordingListItem):

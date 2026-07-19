@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .config import get_settings
-from . import auth, settings_api, transcription
+from . import admin_api, auth, settings_api, transcription
 from .db import get_session, init_db
 from .models import Job, JobStage, Recording, User
 from .schemas import (
@@ -23,7 +23,7 @@ from .schemas import (
 )
 from .auth import get_current_user
 from .storage import audio_path, delete_audio, save_audio
-from .tasks import start_worker, stop_worker
+from .tasks import reprocess, retry_summary, start_worker, stop_worker
 
 logger = logging.getLogger("smoothie")
 
@@ -81,6 +81,7 @@ async def health() -> HealthOut:
 
 app.include_router(auth.router)
 app.include_router(settings_api.router)
+app.include_router(admin_api.router)
 
 
 @app.post("/api/recordings", response_model=RecordingListItem, status_code=201)
@@ -123,12 +124,26 @@ async def list_recordings(
     result = await session.execute(
         select(Recording)
         .where(Recording.user_id == user.id)
+        .options(selectinload(Recording.job))
         .order_by(Recording.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
     recordings = result.scalars().all()
-    return [RecordingListItem.model_validate(r) for r in recordings]
+    items = []
+    for r in recordings:
+        item = RecordingListItem.model_validate(
+            {c.name: getattr(r, c.name) for c in Recording.__table__.columns}
+        )
+        if r.job is not None:
+            # While actively transcribing, read the live progress hook so the
+            # sidebar bar advances; otherwise use the stored value.
+            if r.job.stage == JobStage.TRANSCRIBING:
+                item.progress = transcription.get_progress()
+            else:
+                item.progress = r.job.progress
+        items.append(item)
+    return items
 
 
 @app.get("/api/recordings/{recording_id}", response_model=RecordingDetail)
@@ -191,6 +206,29 @@ async def delete_recording(
     delete_audio(recording.filename)
     await session.delete(recording)
     await session.commit()
+
+
+@app.post("/api/recordings/{recording_id}/retry-summary", status_code=200)
+async def retry_recording_summary(
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Re-run only the summarization step (transcript already exists).
+
+    Returns 409 if the recording has no transcript yet (use a full retry
+    instead) and 404 if it doesn't belong to the caller.
+    """
+    recording = await session.get(Recording, recording_id)
+    if recording is None or recording.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    ok = await retry_summary(recording_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail="No transcript to summarize yet. Re-run the full job instead.",
+        )
+    return {"ok": True, "status": "summarizing"}
 
 
 @app.get("/api/recordings/{recording_id}/audio")

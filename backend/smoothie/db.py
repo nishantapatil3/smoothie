@@ -63,6 +63,28 @@ async def _migrate_columns(conn) -> None:
             )
         )
 
+    # Subscription tier + lifetime usage counters added with the tiers feature.
+    # On a pre-tiers database, the users table has neither column; add them
+    # with safe defaults (free tier, zero usage).
+    existing_users = {
+        row[1]
+        for row in await conn.execute(text("PRAGMA table_info(users)"))
+    }
+    if "tier" not in existing_users:
+        await conn.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN tier VARCHAR(16) "
+                "NOT NULL DEFAULT 'free'"
+            )
+        )
+    if "usage_minutes" not in existing_users:
+        await conn.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN usage_minutes "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:

@@ -13,6 +13,13 @@ export default function RecordingCard({ rec, active, onSelect }) {
   const pct = Math.round((rec.progress || 0) * 100);
   // Summarizing has no native progress; show an indeterminate bar.
   const indeterminate = rec.status === "summarizing";
+  // Transcribing reports real progress; pending/queued shows 0%.
+  const progressLabel =
+    rec.status === "transcribing"
+      ? `${pct}%`
+      : rec.status === "summarizing"
+        ? "…"
+        : "Queued";
 
   return (
     <button
@@ -24,8 +31,12 @@ export default function RecordingCard({ rec, active, onSelect }) {
         <span className={`badge ${rec.status}`}>
           {STATUS_LABEL[rec.status] || rec.status}
         </span>
-        {rec.duration_sec != null && (
-          <span className="muted">{rec.duration_sec.toFixed(1)}s</span>
+        {inProgress ? (
+          <span className="muted">{progressLabel}</span>
+        ) : (
+          rec.duration_sec != null && (
+            <span className="muted">{rec.duration_sec.toFixed(1)}s</span>
+          )
         )}
       </div>
       {inProgress && (

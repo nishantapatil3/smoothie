@@ -1,6 +1,6 @@
 // Renders a recording's transcript + summary, polling while in progress.
 import { useEffect, useState } from "react";
-import { getRecording, deleteRecording } from "../api.js";
+import { getRecording, deleteRecording, retrySummary } from "../api.js";
 
 const TERMINAL = ["completed", "failed"];
 const IN_PROGRESS = ["pending", "transcribing", "summarizing"];
@@ -30,6 +30,8 @@ function ProgressBar({ status, progress }) {
 export default function TranscriptView({ id, onDeleted }) {
   const [rec, setRec] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +68,19 @@ export default function TranscriptView({ id, onDeleted }) {
     onDeleted?.();
   }
 
+  async function onRetrySummary() {
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await retrySummary(rec.id);
+      // The polling effect will pick up the summarzing -> completed transition.
+    } catch (err) {
+      setRetryError(err.message);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
     <div className="detail">
       <div className="detail-head">
@@ -76,7 +91,24 @@ export default function TranscriptView({ id, onDeleted }) {
       </div>
 
       {rec.status === "failed" && (
-        <div className="error box">Failed: {rec.error}</div>
+        <div className="error box">
+          <div>Failed: {rec.error}</div>
+          {rec.full_text ? (
+            <button
+              className="btn primary small"
+              onClick={onRetrySummary}
+              disabled={retrying}
+              style={{ marginTop: 10 }}
+            >
+              {retrying ? "Retrying…" : "↻ Retry summary"}
+            </button>
+          ) : (
+            <div className="muted small" style={{ marginTop: 8 }}>
+              Transcript not ready — re-run the full job to retry.
+            </div>
+          )}
+          {retryError && <div className="muted small" style={{ marginTop: 8 }}>{retryError}</div>}
+        </div>
       )}
 
       {IN_PROGRESS.includes(rec.status) && (

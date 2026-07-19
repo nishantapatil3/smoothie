@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .db import get_session
 from .models import RefreshToken, User
+from .tiers import default_tier
 
 logger = logging.getLogger("smoothie")
 
@@ -223,6 +224,39 @@ class UserOut(BaseModel):
     id: str
     username: str
     created_at: datetime
+    tier: str
+    usage_minutes: int
+    # Lifetime transcription-minute budget for the tier (omitted when unlimited,
+    # so the UI can show "Unlimited" instead of a number).
+    tier_limit_minutes: float | None = None
+    # Remaining minutes in the lifetime budget (omitted when unlimited).
+    tier_remaining_minutes: float | None = None
+    # Whether this user may manage tiers / open admin-only UI (Settings tab).
+    is_admin: bool = False
+
+    @classmethod
+    def from_user(cls, user: "User") -> "UserOut":
+        """Build the response, attaching tier limit/remaining from tiers.py."""
+        from .config import get_settings
+        from .tiers import UNLIMITED, transcribe_limit_minutes
+
+        limit = transcribe_limit_minutes(user.tier)
+        remaining = None
+        limit_out = None
+        if limit is not UNLIMITED:
+            limit_out = int(limit)
+            remaining = max(0, int(limit) - int(user.usage_minutes))
+        admins = get_settings().admin_usernames or []
+        return cls(
+            id=user.id,
+            username=user.username,
+            created_at=user.created_at,
+            tier=user.tier,
+            usage_minutes=int(user.usage_minutes),
+            tier_limit_minutes=limit_out,
+            tier_remaining_minutes=remaining,
+            is_admin=user.username in admins,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +303,7 @@ async def register(
         id=uuid.uuid4().hex,
         username=body.username,
         password_hash=hash_password(body.password),
+        tier=default_tier(),
     )
     session.add(user)
     await session.commit()
@@ -320,4 +355,4 @@ async def logout(
 
 @router.get("/me", response_model=UserOut)
 async def me(user: User = Depends(get_current_user)) -> UserOut:
-    return UserOut.model_validate(user)
+    return UserOut.from_user(user)

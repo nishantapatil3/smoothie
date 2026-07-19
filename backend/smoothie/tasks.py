@@ -16,10 +16,11 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .db import async_session, init_db
-from .models import Job, JobStage, Recording, Summary, Transcript
+from .models import Job, JobStage, Recording, Summary, Transcript, User
 from .storage import delete_audio
 from .summarize import SummaryError, get_provider
 from .transcription import TranscriptionError, transcribe, warm_model
+from .tiers import can_transcribe
 
 logger = logging.getLogger("smoothie.tasks")
 
@@ -90,25 +91,84 @@ async def _process_one() -> None:
             return
 
         recording = await _load_recording(session, job.recording_id)
-        try:
-            # --- Transcribe ---
-            job.stage = JobStage.TRANSCRIBING
-            recording.status = JobStage.TRANSCRIBING
+        if recording is None:
+            # Recording vanished; clear the orphaned job so it stops polling.
+            await session.delete(job)
             await session.commit()
+            return
 
-            path = str(_audio_path_for(recording.filename))
-            # mlx_whisper.transcribe is blocking; run it off the event loop.
-            result = await asyncio.to_thread(
-                transcribe, path, recording.language
+        # --- Enforce tier limits (lifetime transcription budget) ---
+        # Gate compute here (not at upload) per the chosen design: uploads are
+        # always accepted, but a free user whose 30-minute budget is exhausted
+        # has the job marked FAILED with a clear upgrade message.
+        owner = await session.get(User, recording.user_id)
+        tier_value = owner.tier if owner is not None else "free"
+        usage_minutes = float(owner.usage_minutes) if owner is not None else 0.0
+        allowed, used, limit = can_transcribe(tier_value, usage_minutes)
+        if not allowed:
+            # Capture plain ids before rolling back the claim transaction; the
+            # rolled-back session detaches `job`/`recording`, so accessing their
+            # ORM attributes later would raise MissingGreenlet on async SQLite.
+            job_id = job.id
+            recording_id = recording.id
+            await session.rollback()
+            async with async_session() as s2:
+                j = await s2.get(Job, job_id)
+                if j is not None:
+                    j.stage = JobStage.FAILED
+                    j.error = (
+                        "Transcription limit reached: your free tier allows "
+                        f"{int(limit)} minutes of transcription. Upgrade to "
+                        "Standard or Pro to continue."
+                    )
+                    rec = await s2.get(Recording, recording_id)
+                    if rec is not None:
+                        rec.status = JobStage.FAILED
+                    await s2.commit()
+            logger.info(
+                "Job %s blocked: %s tier exceeded %d-min budget.",
+                job_id, tier_value, int(limit),
+            )
+            return
+
+        try:
+            # --- Summarize-only resume ---
+            # If transcription already succeeded (a transcript exists) but the
+            # job is sitting in SUMMARIZING — e.g. a summary retry after a
+            # failed summarization — skip re-transcribing and reuse the text.
+            resume_summary = (
+                job.stage == JobStage.SUMMARIZING
+                and recording.transcript is not None
             )
 
-            transcript = recording.transcript or Transcript(recording_id=recording.id)
-            transcript.full_text = result.text
-            transcript.segments = result.segments
-            session.add(transcript)
-            recording.duration_sec = _duration_from(result.segments)
-            job.progress = result.progress
-            await session.commit()
+            if resume_summary:
+                summary_text_in = recording.transcript.full_text
+            else:
+                # --- Transcribe ---
+                job.stage = JobStage.TRANSCRIBING
+                recording.status = JobStage.TRANSCRIBING
+                await session.commit()
+
+                path = str(_audio_path_for(recording.filename))
+                # mlx_whisper.transcribe is blocking; run it off the event loop.
+                result = await asyncio.to_thread(
+                    transcribe, path, recording.language
+                )
+
+                transcript = recording.transcript or Transcript(
+                    recording_id=recording.id
+                )
+                transcript.full_text = result.text
+                transcript.segments = result.segments
+                session.add(transcript)
+                recording.duration_sec = _duration_from(result.segments)
+                job.progress = result.progress
+                # Account the consumed transcription time against the lifetime
+                # budget. Truncate to whole minutes so the meter is predictable.
+                if owner is not None:
+                    owner.usage_minutes += int((recording.duration_sec or 0) // 60)
+                await session.commit()
+                summary_text_in = result.text
 
             # --- Summarize ---
             job.stage = JobStage.SUMMARIZING
@@ -116,7 +176,7 @@ async def _process_one() -> None:
             await session.commit()
 
             provider = get_provider()
-            summary_text = await provider.summarize(result.text)
+            summary_text = await provider.summarize(summary_text_in)
 
             summary = recording.summary or Summary(recording_id=recording.id)
             summary.markdown = summary_text
@@ -145,7 +205,7 @@ async def _process_one() -> None:
 async def _claim_pending(session: AsyncSession) -> Job | None:
     stmt = (
         select(Job)
-        .where(Job.stage == JobStage.PENDING)
+        .where(Job.stage.in_([JobStage.PENDING, JobStage.SUMMARIZING]))
         .with_for_update(skip_locked=True)
         .limit(1)
     )
@@ -195,3 +255,37 @@ async def reprocess(recording_id: str) -> None:
         if recording is not None:
             recording.status = JobStage.PENDING
         await session.commit()
+
+
+async def retry_summary(recording_id: str) -> bool:
+    """Re-run only the summarization step for a recording.
+
+    Succeeds (returns True) only when a transcript already exists, i.e.
+    transcription completed but summarization failed or needs a redo. The job
+    is set to SUMMARIZING so the worker resumes straight into the summary step
+    (see ``_process_one``'s summarize-only branch) without re-transcribing.
+    Returns False when there is no transcript to summarize yet (the caller
+    should offer a full reprocess instead).
+    """
+    async with async_session() as session:
+        recording = (
+            await session.execute(
+                select(Recording)
+                .where(Recording.id == recording_id)
+                .options(selectinload(Recording.transcript))
+            )
+        ).scalar_one_or_none()
+        if recording is None or recording.transcript is None:
+            return False
+        job = (
+            await session.execute(
+                select(Job).where(Job.recording_id == recording_id)
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            return False
+        job.stage = JobStage.SUMMARIZING
+        job.error = None
+        recording.status = JobStage.SUMMARIZING
+        await session.commit()
+        return True

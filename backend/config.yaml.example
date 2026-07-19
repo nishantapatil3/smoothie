@@ -49,6 +49,12 @@ auth_access_ttl_minutes: 60
 auth_refresh_ttl_days: 7
 auth_min_password_len: 8
 
+# --- Tier administration ---
+# Usernames allowed to list users and change their subscription tier via the
+# admin API/UI. Empty = no one can change tiers (free-tier limits still apply).
+# Add your username here to manage tiers, e.g. ["admin"].
+admin_usernames: []
+
 # --- Pre-audio-processing (pluggable modules) ---
 ffmpeg_bin: ""  # auto-detected via shutil.which if empty
 

@@ -140,6 +140,21 @@ export async function saveSettings(updates) {
   );
 }
 
+// ── Admin (tier management; admin usernames only) ────────────────────
+export async function listUsers() {
+  return handle(await authedFetch(`${base}/admin/users`));
+}
+
+export async function setUserTier(userId, tier) {
+  return handle(
+    await authedFetch(`${base}/admin/users/${userId}/tier`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tier }),
+    })
+  );
+}
+
 // ── Recordings (require auth) ─────────────────────────────────────────
 export async function listRecordings() {
   return handle(await authedFetch(`${base}/recordings`));
@@ -161,4 +176,13 @@ export async function uploadRecording(file, title) {
 export async function deleteRecording(id) {
   const res = await authedFetch(`${base}/recordings/${id}`, { method: "DELETE" });
   if (!res.ok && res.status !== 204) throw new Error("Delete failed");
+}
+
+// Re-run only the summarization step (requires an existing transcript).
+export async function retrySummary(id) {
+  return handle(
+    await authedFetch(`${base}/recordings/${id}/retry-summary`, {
+      method: "POST",
+    })
+  );
 }

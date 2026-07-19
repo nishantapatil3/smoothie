@@ -42,6 +42,7 @@ class SettingsOut(BaseModel):
     auth_access_ttl_minutes: int
     auth_refresh_ttl_days: int
     auth_min_password_len: int
+    admin_usernames: list[str]
     trim_enabled: bool
     trim_threshold: int
     trim_min_silence: float
@@ -75,6 +76,7 @@ class SettingsUpdate(BaseModel):
     auth_access_ttl_minutes: int | None = None
     auth_refresh_ttl_days: int | None = None
     auth_min_password_len: int | None = None
+    admin_usernames: list[str] | None = None
     trim_enabled: bool | None = None
     trim_threshold: int | None = None
     trim_min_silence: float | None = None

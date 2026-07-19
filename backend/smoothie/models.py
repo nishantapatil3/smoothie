@@ -37,6 +37,12 @@ class User(Base):
     )
     # bcrypt hash (or other passlib-compatible scheme) of the password.
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Subscription tier ("free" | "standard" | "pro"). Drives usage limits and
+    # feature availability; see smoothie/tiers.py.
+    tier: Mapped[str] = mapped_column(String(16), nullable=False, default="free")
+    # Lifetime transcription minutes consumed. Compared against the tier's cap
+    # in tiers.py; never resets (free tier is a one-time budget).
+    usage_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now
     )

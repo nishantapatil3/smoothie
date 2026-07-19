@@ -9,6 +9,7 @@ import TranscriptView from "./components/TranscriptView.jsx";
 export default function App() {
   const [authed, setAuthed] = useState(() => Boolean(getToken()));
   const [view, setView] = useState("app"); // "app" | "settings"
+  const [me, setMe] = useState(null); // full /me payload (tier, usage, etc.)
   const [username, setUsername] = useState(null);
   const [recordings, setRecordings] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -18,10 +19,14 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     getMe()
-      .then((me) => setUsername(me.username))
+      .then((m) => {
+        setMe(m);
+        setUsername(m.username);
+      })
       .catch(() => {
         // Token invalid/expired and no usable refresh — drop back to login.
         clearTokens();
+        setMe(null);
         setUsername(null);
         setRecordings([]);
         setSelectedId(null);
@@ -63,7 +68,10 @@ export default function App() {
 
   function onAuthed() {
     getMe()
-      .then((me) => setUsername(me.username))
+      .then((m) => {
+        setMe(m);
+        setUsername(m.username);
+      })
       .catch(() => {});
     setAuthed(true);
   }
@@ -93,13 +101,29 @@ export default function App() {
           >
             🏠 Home
           </button>
-          <button
-            className={`btn ghost ${view === "settings" ? "active" : ""}`}
-            onClick={() => setView("settings")}
-          >
-            ⚙ Settings
-          </button>
+          {me?.is_admin && (
+            <button
+              className={`btn ghost ${view === "settings" ? "active" : ""}`}
+              onClick={() => setView("settings")}
+            >
+              ⚙ Settings
+            </button>
+          )}
           {username && <span className="muted">{username}</span>}
+          {me && (
+            <span
+              className={`tier-badge tier-${me.tier}`}
+              title={
+                me.tier === "free" && me.tier_remaining_minutes != null
+                  ? `${me.tier_remaining_minutes} of ${me.tier_limit_minutes} min remaining`
+                  : "Unlimited transcription"
+              }
+            >
+              {me.tier}
+              {me.tier === "free" && me.tier_remaining_minutes != null &&
+                ` · ${me.tier_remaining_minutes}m left`}
+            </span>
+          )}
           <button className="btn ghost" onClick={handleLogout}>
             Log out
           </button>
@@ -107,7 +131,10 @@ export default function App() {
       </header>
 
       {view === "settings" ? (
-        <Settings />
+        <Settings
+          me={me}
+          onTierChanged={() => getMe().then(setMe).catch(() => {})}
+        />
       ) : (
         <>
           <Recorder onUploaded={onUploaded} />

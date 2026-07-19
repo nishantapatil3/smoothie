@@ -93,6 +93,13 @@ class Settings(BaseModel):
     # Minimum accepted password length at registration.
     auth_min_password_len: int = 8
 
+    # --- Tier administration ---
+    # Usernames allowed to list users and change their subscription tier via
+    # the admin endpoints. Empty = no one can change tiers through the UI/API
+    # (free-tier limits still apply to everyone). Add usernames here to grant
+    # admin rights, e.g. ["admin"].
+    admin_usernames: list[str] = Field(default_factory=list)
+
     # --- Pre-audio-processing (pluggable modules) ---
     # Modules run before transcription. Each is independently enable/disable-able.
     # See smoothie/preprocess/ for the module implementations.
