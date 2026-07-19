@@ -1,0 +1,33 @@
+[project]
+name = "smoothie"
+version = "0.1.0"
+description = "Local-first audio transcription and summarization server (MLX Whisper + pluggable LLM summaries)"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "mlx-whisper>=0.1.0",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.19",
+    "httpx>=0.27",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["smoothie"]
+
+[tool.setuptools.package-data]
+smoothie = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

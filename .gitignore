@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Backend data (db + uploaded audio)
+backend/data/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node / webui
+webui/node_modules/
+webui/dist/
+webui/.env.local
+webui/.env.*.local
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+.AppleDouble
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
