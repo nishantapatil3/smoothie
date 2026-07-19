@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     # auto-detection, or any language code (e.g. "es", "fr").
     transcription_language: str | None = "en"
 
+    # --- VAD-based chunking (long audio) ---
+    # When enabled (and silero-vad is installed), long audio is split at natural
+    # speech pauses instead of fixed 30s windows, matching meetily's chunking:
+    # one Whisper call per speech-aligned segment, continuous timeline, no
+    # overlap. Falls back to fixed-window chunking if VAD is unavailable.
+    vad_enabled: bool = True
+    vad_threshold: float = 0.5          # Silero speech probability threshold
+    vad_min_speech_ms: int = 250        # ignore sounds shorter than this
+    vad_min_silence_ms: int = 400       # pause length that ends a chunk run
+    vad_speech_pad_ms: int = 200        # pad each run so onsets/tails aren't cut
+    vad_chunk_target_sec: int = 24      # target merged chunk length (~meetily 22-27s)
+    vad_chunk_max_sec: int = 30         # hard cap on a single chunk
+
     # --- Summary provider (generic OpenAI-compatible API endpoint) ---
     # The backend talks to a single /chat/completions endpoint. Point it at any
     # summarizer LLM — a local server (e.g. http://localhost:11434/v1), a remote
@@ -56,8 +69,10 @@ class Settings(BaseSettings):
     # See smoothie/preprocess/ for the module implementations.
     ffmpeg_bin: str = ""  # auto-detected via shutil.which if empty
 
-    # trim: remove silence with ffmpeg silenceremove (conservative default).
-    trim_enabled: bool = True
+    # trim: remove silence with ffmpeg silenceremove. Disabled because it
+    # strips internal silence too, collapsing real duration (e.g. 6 min -> 99s)
+    # and corrupting duration_sec + segment timestamps.
+    trim_enabled: bool = False
     # Noise floor (dB) below which audio is treated as silence, e.g. -40.
     trim_threshold: int = -40
     # Minimum silent stretch (seconds) to cut, e.g. 0.5.

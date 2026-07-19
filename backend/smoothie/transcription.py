@@ -16,11 +16,13 @@ from pathlib import Path
 import mlx.core as mx
 import mlx_whisper
 import mlx_whisper.load_models as _load_models
+import numpy as np
 import tqdm
 from huggingface_hub import snapshot_download
 
 from .config import get_settings
 from .preprocess import collect_transcribe_options, run_audio_transforms
+from . import vad as _vad
 
 logger = logging.getLogger("smoothie.transcription")
 
@@ -171,15 +173,34 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
     try:
         audio = _load_waveform(processed_path)
         if _needs_chunking(audio):
-            logger.info(
-                "Audio is %.1fs; transcribing in %ds windows to avoid "
-                "single-pass truncation.",
-                len(audio) / 16000.0,
-                _CHUNK_SECONDS,
-            )
-            result = _transcribe_chunked(
-                audio, model_id, lang, collect_transcribe_options(settings)
-            )
+            # Prefer speech-aligned (VAD) chunking when enabled and available:
+            # it splits at natural pauses like meetily, rather than fixed 30s
+            # windows that can cut a sentence in half.
+            vad_chunks = None
+            if settings.vad_enabled and _vad.vad_available():
+                vad_chunks = _plan_vad_chunks(audio, settings)
+            if vad_chunks:
+                logger.info(
+                    "Audio is %.1fs; transcribing %d VAD speech-aligned chunk(s) "
+                    "(~%ds target) to avoid single-pass truncation.",
+                    len(audio) / 16000.0,
+                    len(vad_chunks),
+                    settings.vad_chunk_target_sec,
+                )
+                result = _transcribe_vad_chunks(
+                    audio, vad_chunks, model_id, lang,
+                    collect_transcribe_options(settings),
+                )
+            else:
+                logger.info(
+                    "Audio is %.1fs; transcribing in %ds windows to avoid "
+                    "single-pass truncation.",
+                    len(audio) / 16000.0,
+                    _CHUNK_SECONDS,
+                )
+                result = _transcribe_chunked(
+                    audio, model_id, lang, collect_transcribe_options(settings)
+                )
         else:
             result = mlx_whisper.transcribe(
                 processed_path,
@@ -229,6 +250,15 @@ def _load_waveform(path: str) -> "mx.array":
     caller's existing error handling applies.
     """
     return mlx_whisper.audio.load_audio(path)
+
+
+def _load_waveform_np(path: str) -> np.ndarray:
+    """Decode an audio file to a 1-D float32 numpy waveform at 16 kHz.
+
+    Silero VAD wants a numpy/torch array (not an MLX array), so the VAD path
+    uses this. mlx_whisper.transcribe also accepts numpy windows fine.
+    """
+    return np.asarray(mlx_whisper.audio.load_audio(path), dtype=np.float32)
 
 
 def _needs_chunking(audio: "mx.array") -> bool:
@@ -282,6 +312,100 @@ def _transcribe_chunked(
             s for s in chunk_result.get("segments", []) if s.get("end", 0.0) > overlap_skip
         ]
         for seg in window_segments:
+            all_segments.append(
+                {
+                    "start": float(seg.get("start", 0.0)) + offset,
+                    "end": float(seg.get("end", 0.0)) + offset,
+                    "text": seg.get("text", "").strip(),
+                }
+            )
+        text = chunk_result.get("text", "").strip()
+        if text:
+            all_text.append(text)
+
+    return {
+        "text": " ".join(all_text),
+        "segments": all_segments,
+        "language": lang or "en",
+    }
+
+
+def _plan_vad_chunks(audio: "mx.array", settings) -> list[tuple[int, int]] | None:
+    """Detect speech and merge it into transcription chunks.
+
+    Returns a list of (start_sample, end_sample) boundaries, or ``None`` if VAD
+    fails (so the caller falls back to fixed-window chunking). ``audio`` is the
+    MLX waveform; we re-decode to numpy for VAD (mlx_whisper caches the decode,
+    so this is cheap).
+    """
+    try:
+        np_audio = np.asarray(audio, dtype=np.float32)
+        timestamps = _vad.speech_timestamps(
+            np_audio,
+            threshold=settings.vad_threshold,
+            min_speech_ms=settings.vad_min_speech_ms,
+            min_silence_ms=settings.vad_min_silence_ms,
+            speech_pad_ms=settings.vad_speech_pad_ms,
+        )
+        if not timestamps:
+            logger.warning("VAD found no speech; falling back to fixed windows.")
+            return None
+        # Silero can return a single long unbroken segment (e.g. a 47s monologue
+        # with no pause). Subdivide any run longer than the max chunk so the
+        # merge step can't produce an oversized chunk.
+        max_samples = settings.vad_chunk_max_sec * 16000
+        split: list[tuple[int, int]] = []
+        for start, end in timestamps:
+            if end - start <= max_samples:
+                split.append((start, end))
+            else:
+                for s in range(start, end, max_samples):
+                    split.append((s, min(s + max_samples, end)))
+        return _vad.merge_into_chunks(
+            split,
+            target_samples=settings.vad_chunk_target_sec * 16000,
+            max_samples=max_samples,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to fallback chunking
+        logger.warning("VAD chunking failed (%s); using fixed windows.", exc)
+        return None
+
+
+def _transcribe_vad_chunks(
+    audio: "mx.array",
+    chunks: list[tuple[int, int]],
+    model_id: str,
+    lang: str | None,
+    options: dict,
+) -> dict:
+    """Transcribe VAD-merged speech chunks with one Whisper call each.
+
+    Each chunk is a continuous run of speech, so Whisper is never cut mid-sentence
+    and there is no overlap to dedupe. Segment timestamps are shifted by each
+    chunk's start offset so the merged timeline stays continuous and matches the
+    real audio clock.
+    """
+    np_audio = np.asarray(audio, dtype=np.float32)
+    sr = 16000
+
+    all_text: list[str] = []
+    all_segments: list[dict] = []
+
+    for start, end in chunks:
+        window = np_audio[start:end]
+        if window.shape[0] < sr:  # ignore sub-second tails
+            continue
+        chunk_result = mlx_whisper.transcribe(
+            window,
+            path_or_hf_repo=model_id,
+            language=lang,
+            word_timestamps=False,
+            verbose=False,
+            condition_on_previous_text=False,
+            **options,
+        )
+        offset = start / sr
+        for seg in chunk_result.get("segments", []):
             all_segments.append(
                 {
                     "start": float(seg.get("start", 0.0)) + offset,
