@@ -12,15 +12,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from .config import get_settings
-from . import transcription
+from . import auth, settings_api, transcription
 from .db import get_session, init_db
-from .models import Job, JobStage, Recording
+from .models import Job, JobStage, Recording, User
 from .schemas import (
     HealthOut,
     RecordingDetail,
     RecordingListItem,
     SegmentOut,
 )
+from .auth import get_current_user
 from .storage import audio_path, delete_audio, save_audio
 from .tasks import start_worker, stop_worker
 
@@ -78,12 +79,17 @@ async def health() -> HealthOut:
     )
 
 
+app.include_router(auth.router)
+app.include_router(settings_api.router)
+
+
 @app.post("/api/recordings", response_model=RecordingListItem, status_code=201)
 async def create_recording(
     audio: UploadFile = File(...),
     title: str | None = Form(default=None),
     language: str | None = Form(default=None),
     session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
 ) -> RecordingListItem:
     data = await audio.read()
     if not data:
@@ -92,6 +98,7 @@ async def create_recording(
     filename, _ = save_audio(data, audio.content_type)
 
     recording = Recording(
+        user_id=user.id,
         title=title or audio.filename,
         filename=filename,
         content_type=audio.content_type,
@@ -109,11 +116,13 @@ async def create_recording(
 @app.get("/api/recordings", response_model=list[RecordingListItem])
 async def list_recordings(
     session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[RecordingListItem]:
     result = await session.execute(
         select(Recording)
+        .where(Recording.user_id == user.id)
         .order_by(Recording.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -124,11 +133,13 @@ async def list_recordings(
 
 @app.get("/api/recordings/{recording_id}", response_model=RecordingDetail)
 async def get_recording(
-    recording_id: str, session: AsyncSession = Depends(get_session)
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
 ) -> RecordingDetail:
     result = await session.execute(
         select(Recording)
-        .where(Recording.id == recording_id)
+        .where(Recording.id == recording_id, Recording.user_id == user.id)
         .options(
             selectinload(Recording.transcript),
             selectinload(Recording.summary),
@@ -170,10 +181,12 @@ async def get_recording(
 
 @app.delete("/api/recordings/{recording_id}", status_code=204)
 async def delete_recording(
-    recording_id: str, session: AsyncSession = Depends(get_session)
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
 ) -> None:
     recording = await session.get(Recording, recording_id)
-    if recording is None:
+    if recording is None or recording.user_id != user.id:
         raise HTTPException(status_code=404, detail="Recording not found.")
     delete_audio(recording.filename)
     await session.delete(recording)
@@ -182,10 +195,12 @@ async def delete_recording(
 
 @app.get("/api/recordings/{recording_id}/audio")
 async def get_audio(
-    recording_id: str, session: AsyncSession = Depends(get_session)
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
 ) -> FileResponse:
     recording = await session.get(Recording, recording_id)
-    if recording is None:
+    if recording is None or recording.user_id != user.id:
         raise HTTPException(status_code=404, detail="Recording not found.")
     path = audio_path(recording.filename)
     if not path.exists():

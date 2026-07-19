@@ -25,7 +25,7 @@ class TrimModule(AudioProcessor):
         ffmpeg = settings.ffmpeg_bin or shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError(
-                "ffmpeg not found. Install ffmpeg or set SMOOTHIE_FFMPEG_BIN."
+                "ffmpeg not found. Install ffmpeg or set ffmpeg_bin in config.yaml."
             )
 
         # Remove silence throughout the file while keeping all speech in order.

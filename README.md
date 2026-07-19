@@ -60,6 +60,19 @@ npm run dev        # http://localhost:5174  (proxies /api -> :5173)
 Open http://localhost:5174, record or upload audio, and watch the transcript +
 summary appear.
 
+### First run / accounts
+
+Smoothie is multi-user. On first open the web UI shows a login screen — click
+**"Need an account? Register"** to create the first account. Set a stable
+`auth_secret` in `config.yaml` (e.g. `openssl rand -hex 32`) so issued tokens
+survive backend restarts; without it an ephemeral secret is generated each boot
+and you will be logged out on restart.
+
+> **Upgrading an existing database:** pre-auth recordings had no owner. The
+> `user_id` column is added automatically, but those legacy rows keep an empty
+> owner and are hidden from all accounts. Start fresh (or re-import) for a
+> fully-owned library.
+
 ### Single-process production mode
 
 Build the UI, then run only the backend — it serves the built UI at `/`:
@@ -91,21 +104,32 @@ The test suite pins key behaviors:
 
 ## Configuration
 
-All settings are environment variables (prefix `SMOOTHIE_`), e.g. via a `backend/.env`.
-A ready-to-edit template lives at `backend/.env.example` — copy it to `.env` and
-adjust. **`backend/.env` contains secrets (e.g. `SMOOTHIE_SUMMARY_KEY`) and is
-git-ignored; only `.env.example` is committed.**
+All settings live in **`backend/config.yaml`** (YAML), the single source of
+truth — there are no environment variables. A fully-commented template is at
+`backend/config.yaml.example`; copy it to `config.yaml` and adjust, or just let
+the server create one on first save. **`config.yaml` is git-ignored** (it can
+hold secrets like `summary_key` / `auth_secret`); only `config.yaml.example` is
+committed.
 
-| Variable | Default | Purpose |
+The web UI has a **Settings** page (⚙ in the header) that reads and edits every
+setting live — changes apply immediately and are written back to `config.yaml`.
+`auth_secret`, `data_dir`, and `ffmpeg_bin` are **not** exposed in the UI
+(secret / database-stability); set those directly in `config.yaml`.
+
+| Setting | Default | Purpose |
 | --- | --- | --- |
-| `SMOOTHIE_HOST` | `0.0.0.0` | Bind address for the backend server |
-| `SMOOTHIE_PORT` | `5173` | Port the backend listens on |
-| `SMOOTHIE_JOB_POLL_INTERVAL` | `2.0` | Background job loop polling interval (seconds) |
-| `SMOOTHIE_TRANSCRIPTION_MODEL` | `mlx-community/whisper-large-v3-mlx` | MLX Whisper model id (tiny/small/medium/large-v3) |
-| `SMOOTHIE_TRANSCRIPTION_LANGUAGE` | `en` | Force a language code, or unset for auto-detect |
-| `SMOOTHIE_SUMMARY_URL` | `http://localhost:11434/v1` | OpenAI-compatible `/chat/completions` base URL |
-| `SMOOTHIE_SUMMARY_KEY` | _(empty)_ | Optional bearer token for the endpoint |
-| `SMOOTHIE_SUMMARY_MODEL` | `llama3.2` | Model name to request from the summarizer LLM |
+| `host` | `0.0.0.0` | Bind address for the backend server |
+| `port` | `5173` | Port the backend listens on |
+| `job_poll_interval` | `2.0` | Background job loop polling interval (seconds) |
+| `auth_secret` | _(ephemeral)_ | Secret signing access tokens (HMAC). Set a stable random value so tokens survive restarts |
+| `auth_access_ttl_minutes` | `60` | Access token lifetime in minutes (refreshed silently) |
+| `auth_refresh_ttl_days` | `7` | Refresh token lifetime in days (rotated on each use) |
+| `auth_min_password_len` | `8` | Minimum password length at registration |
+| `transcription_model` | `mlx-community/whisper-large-v3-mlx` | MLX Whisper model id (tiny/small/medium/large-v3) |
+| `transcription_language` | `en` | Force a language code, or empty for auto-detect |
+| `summary_url` | `http://localhost:11434/v1` | OpenAI-compatible `/chat/completions` base URL |
+| `summary_key` | _(empty)_ | Optional bearer token for the endpoint |
+| `summary_model` | `llama3.2` | Model name to request from the summarizer LLM |
 
 ### Pre-audio-processing (pluggable modules)
 
@@ -115,20 +139,27 @@ configured; a module that fails falls back to its input so a misconfigured
 filter never breaks a job. Add a module by implementing `AudioProcessor` (audio
 transform) or `TranscribeTuner` (Whisper options) and registering it.
 
-| Variable | Default | Purpose |
+| Setting | Default | Purpose |
 | --- | --- | --- |
-| `SMOOTHIE_FFMPEG_BIN` | _(auto-detect)_ | Path to the `ffmpeg` binary |
-| `SMOOTHIE_TRIM_ENABLED` | `true` | Trim silence before transcription |
-| `SMOOTHIE_TRIM_THRESHOLD` | `-40` | Noise floor (dB) treated as silence |
-| `SMOOTHIE_TRIM_MIN_SILENCE` | `0.5` | Min silent stretch (s) to cut |
-| `SMOOTHIE_TUNE_ENABLED` | `true` | Surface Whisper decode options |
-| `SMOOTHIE_TUNE_BEAM_SIZE` | _(unset)_ | `beam_size` (None = greedy, like meetily) |
-| `SMOOTHIE_TUNE_CONDITION_ON_PREVIOUS_TEXT` | _(unset)_ | Feed prior text into next window |
-| `SMOOTHIE_TUNE_NO_SPEECH_THRESHOLD` | _(unset)_ | Silence-vs-speech cutoff |
-| `SMOOTHIE_TUNE_HALLUCINATION_SILENCE_THRESHOLD` | `2.0` | Drop likely-hallucinated segments (meetily's "suppress non-speech") |
+| `ffmpeg_bin` | _(auto-detect)_ | Path to the `ffmpeg` binary |
+| `trim_enabled` | `false` | Trim silence before transcription |
+| `trim_threshold` | `-40` | Noise floor (dB) treated as silence |
+| `trim_min_silence` | `0.5` | Min silent stretch (s) to cut |
+| `tune_enabled` | `true` | Surface Whisper decode options |
+| `tune_beam_size` | _(unset)_ | `beam_size` (None = greedy, like meetily) |
+| `tune_condition_on_previous_text` | _(unset)_ | Feed prior text into next window |
+| `tune_no_speech_threshold` | _(unset)_ | Silence-vs-speech cutoff |
+| `tune_hallucination_silence_threshold` | `2.0` | Drop likely-hallucinated segments (meetily's "suppress non-speech") |
+| `vad_enabled` | `true` | Split long audio at speech pauses (meetily-style) instead of fixed windows |
+| `vad_threshold` | `0.5` | Silero speech probability threshold |
+| `vad_min_speech_ms` | `250` | Ignore sounds shorter than this |
+| `vad_min_silence_ms` | `400` | Pause length that ends a chunk run |
+| `vad_speech_pad_ms` | `200` | Pad each run so onsets/tails aren't cut |
+| `vad_chunk_target_sec` | `24` | Target merged chunk length (~meetily 22-27s) |
+| `vad_chunk_max_sec` | `30` | Hard cap on a single chunk |
 
 The transcription stage is tuned to **behave like meetily**: forced language
-(`SMOOTHIE_TRANSCRIPTION_LANGUAGE`, default `en`), temperature fallback
+(`transcription_language`, default `en`), temperature fallback
 (0.0 → 0.2 → …), `no_speech_threshold=0.6`, `condition_on_previous_text=True`,
 `best_of=2`, and `hallucination_silence_threshold=2.0`. All are overridable via
 settings. The `trim` and `tune` modules are the bundled pre-processing steps.
@@ -153,30 +184,53 @@ Point it wherever you want; it's your choice:
 
 **Local summarizer LLM** (default, fully offline — e.g. a local OpenAI-compatible server):
 
-```bash
-# SMOOTHIE_SUMMARY_URL defaults to http://localhost:11434/v1
+```yaml
+# summary_url defaults to http://localhost:11434/v1
 ```
 
-**Remote / other endpoint** (OpenAI, vLLM, LM Studio, …):
+**Remote / other endpoint** (OpenAI, vLLM, LM Studio, …) — set in `config.yaml`:
 
-```bash
-export SMOOTHIE_SUMMARY_URL="https://api.openai.com/v1"
-export SMOOTHIE_SUMMARY_KEY="sk-..."
-export SMOOTHIE_SUMMARY_MODEL="gpt-4o-mini"
+```yaml
+summary_url: https://api.openai.com/v1
+summary_key: "sk-..."
+summary_model: gpt-4o-mini
 ```
 
 The same code path handles all of them — there is no separate Ollama vs cloud mode.
+You can also change these from the web UI **Settings** page without restarting.
 
 ## API
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET`  | `/api/health` | Server status + active model/provider |
-| `POST` | `/api/recordings` | Upload audio (`multipart`: `audio`, optional `title`,`language`) |
-| `GET`  | `/api/recordings` | List recordings (newest first) |
-| `GET`  | `/api/recordings/{id}` | Full detail: status, transcript, summary |
-| `GET`  | `/api/recordings/{id}/audio` | Download the original audio |
-| `DELETE` | `/api/recordings/{id}` | Delete a recording + its audio |
+| `GET`  | `/api/health` | Server status + active model/provider (public) |
+| `POST` | `/api/auth/register` | Create an account → returns `{ token, refresh_token }` |
+| `POST` | `/api/auth/login` | Log in with `username`/`password` → `{ token, refresh_token }` |
+| `POST` | `/api/auth/refresh` | Swap a `refresh_token` for a fresh `{ token, refresh_token }` (old one revoked) |
+| `POST` | `/api/auth/logout` | Revoke a `refresh_token` for the authenticated user |
+| `GET`  | `/api/auth/me` | Current user (requires Bearer token) |
+| `GET`  | `/api/settings` | Current editable settings (requires Bearer token) |
+| `PUT`  | `/api/settings` | Update settings live + persist to `config.yaml` (requires Bearer token) |
+| `POST` | `/api/recordings` | Upload audio (`multipart`: `audio`, optional `title`,`language`) — requires auth |
+| `GET`  | `/api/recordings` | List **your** recordings (newest first) — requires auth |
+| `GET`  | `/api/recordings/{id}` | Full detail: status, transcript, summary — requires auth, owner only |
+| `GET`  | `/api/recordings/{id}/audio` | Download the original audio — requires auth, owner only |
+| `DELETE` | `/api/recordings/{id}` | Delete a recording + its audio — requires auth, owner only |
+
+All `/api/recordings*` routes require an `Authorization: Bearer <token>` header
+issued by `/api/auth/login` (or `/api/auth/register`). Recordings are scoped to
+the owning user — one user cannot see or fetch another's recordings.
+
+**Token model (Ring-style).** Login/register return a short-lived **access
+token** (default 60 min, `auth_access_ttl_minutes`) plus a longer-lived
+**refresh token** (default 7 days, `auth_refresh_ttl_days`). When an
+access token expires (API returns 401), the client calls `POST /api/auth/refresh`
+with its refresh token to obtain a new pair — no re-login needed. Each refresh
+**rotates** the refresh token (the old one is revoked), and `POST
+/api/auth/logout` revokes it, so a leaked refresh token has a bounded lifetime
+and can be invalidated. Refresh tokens are stored only as SHA-256 hashes in the
+`refresh_tokens` table (never the raw value), so they remain valid across
+restarts as long as `auth_secret` is stable.
 
 Job statuses: `pending → transcribing → summarizing → completed` (or `failed`).
 
@@ -185,13 +239,13 @@ Job statuses: `pending → transcribing → summarizing → completed` (or `fail
 ```
 smoothie/
   backend/
-    smoothie/       FastAPI app, mlx-whisper, summary providers, SQLite, preprocess modules
-    tests/          pytest suite (trim regression, progress/status)
-    .env.example    Config template (copy to .env; .env is git-ignored)
-  webui/            React + Vite client
+    smoothie/         FastAPI app, mlx-whisper, summary providers, SQLite, preprocess modules
+    config.yaml.example  Config template (copy to config.yaml)
+    tests/            pytest suite (trim regression, progress/status, auth, settings)
+  webui/              React + Vite client
 ```
 
 ## Out of scope (future iterations)
 
-Speaker diarization, live/streaming transcription, auth & multi-user, mobile apps,
-multiple summary styles, cloud sync.
+Speaker diarization, live/streaming transcription, mobile apps, multiple summary
+styles, cloud sync. (Auth & multi-user accounts **are** supported — see above.)

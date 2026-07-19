@@ -3,7 +3,7 @@
 Mirrors meetily's Whisper decode quality settings so transcription behaves
 like meetily:
   * temperature fallback (0.0 -> 0.2 -> ...)  — MLX Whisper default, kept
-  * forced language (SMOOTHIE_TRANSCRIPTION_LANGUAGE, default "en")
+  * forced language (transcription_language, default "en")
   * no_speech_threshold = 0.6                  — MLX Whisper default, kept
   * condition_on_previous_text = True          — MLX Whisper default, kept
   * hallucination_silence_threshold            — suppress non-speech rambling

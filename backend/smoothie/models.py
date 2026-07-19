@@ -28,6 +28,52 @@ def _uuid() -> str:
     return uuid.uuid4().hex
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    username: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    # bcrypt hash (or other passlib-compatible scheme) of the password.
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )
+
+    recordings: Mapped[list["Recording"]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan",
+    )
+
+
+class RefreshToken(Base):
+    """Stored refresh token (only its hash is persisted, never the raw value).
+
+    Rotated on every use: a refresh swaps in a new token and revokes the old
+    one. Lets sessions be revoked (logout) and limits the blast radius of a
+    leaked token.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # SHA-256 hex of the opaque refresh token issued to the client.
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )
+
+
 class JobStage(str, enum.Enum):
     PENDING = "pending"
     TRANSCRIBING = "transcribing"
@@ -40,6 +86,12 @@ class Recording(Base):
     __tablename__ = "recordings"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -50,6 +102,7 @@ class Recording(Base):
         Enum(JobStage), default=JobStage.PENDING, nullable=False
     )
 
+    owner: Mapped["User"] = relationship(back_populates="recordings")
     transcript: Mapped["Transcript | None"] = relationship(
         back_populates="recording",
         uselist=False,

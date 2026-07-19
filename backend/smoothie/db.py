@@ -47,6 +47,22 @@ async def _migrate_columns(conn) -> None:
             )
         )
 
+    # The users table + recordings.user_id were added with the auth feature.
+    # On a pre-auth database, recordings has no user_id column yet, and the
+    # users table may not exist. Add the column (NOT NULL needs a default;
+    # legacy rows keep their data but become orphaned until reassigned).
+    existing_recordings = {
+        row[1]
+        for row in await conn.execute(text("PRAGMA table_info(recordings)"))
+    }
+    if "user_id" not in existing_recordings:
+        await conn.execute(
+            text(
+                "ALTER TABLE recordings ADD COLUMN user_id "
+                "VARCHAR(32) NOT NULL DEFAULT ''"
+            )
+        )
+
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:
