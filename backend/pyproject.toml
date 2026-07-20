@@ -1,6 +1,6 @@
 [project]
 name = "smoothie"
-version = "0.0.1"
+version = "0.0.2"
 description = "Local-first audio transcription and summarization server (MLX Whisper + pluggable LLM summaries)"
 requires-python = ">=3.10"
 dependencies = [
