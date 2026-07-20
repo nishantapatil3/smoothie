@@ -46,6 +46,26 @@ async def _migrate_columns(conn) -> None:
                 "ALTER TABLE jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0.0"
             )
         )
+    # Job priority for queue ordering (added with priority feature)
+    if "priority" not in existing:
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    # Job cancellation support
+    if "cancelled" not in existing:
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN cancelled BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    if "cancelled_at" not in existing:
+        await conn.execute(
+            text(
+                "ALTER TABLE jobs ADD COLUMN cancelled_at DATETIME"
+            )
+        )
 
     # The users table + recordings.user_id were added with the auth feature.
     # On a pre-auth database, recordings has no user_id column yet, and the

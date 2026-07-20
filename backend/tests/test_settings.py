@@ -26,6 +26,11 @@ def client():
     db.async_session = db.async_sessionmaker(
         db.engine, expire_on_commit=False, class_=db.AsyncSession
     )
+    # Ensure tables exist and migrations run
+    import asyncio
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(db.init_db())
+    loop.close()
 
     with TestClient(app) as c:
         yield c

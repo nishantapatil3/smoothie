@@ -18,6 +18,8 @@ import mlx_whisper
 import mlx_whisper.load_models as _load_models
 import numpy as np
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HFValidationError
+from huggingface_hub.utils import RepositoryNotFoundError
 
 from .config import get_settings
 from .preprocess import collect_transcribe_options, run_audio_transforms
@@ -48,38 +50,30 @@ class TranscriptionResult:
 _CHUNK_SECONDS = 30
 _CHUNK_OVERLAP_SECONDS = 1
 
-# Live transcription progress (0.0-1.0), tracked per audio *segment* (a
-# transcription window / VAD chunk), not per decoder frame. Single-worker app,
-# so a module-level value is safe.
-_progress: dict = {"current": 0, "total": 0}
-
-
-def get_progress() -> float:
-    """Return transcription progress as a fraction (0.0-1.0).
-
-    Computed as ``current_segment / total_segments`` — i.e. how many of the
-    audio segments being transcribed have finished.
-    """
-    total = _progress["total"]
-    if not total:
-        return 0.0
-    return min(1.0, _progress["current"] / total)
-
-
-def _set_segment_total(n: int) -> None:
-    """Declare how many audio segments will be transcribed for this call."""
-    _progress["current"] = 0
-    _progress["total"] = n
-
-
-def _advance_segment() -> None:
-    """Mark one audio segment as transcribed."""
-    _progress["current"] += 1
-
 
 def _model_id() -> str:
     """Return the configured model id/path."""
     return get_settings().transcription_model
+
+
+def _load_model_safe(model_id: str) -> None:
+    """Load ``model_id`` into MLX memory, raising a clear error on failure.
+
+    A missing/non-existent Hugging Face repo raises a confusing
+    ``401 Client Error`` / "Invalid username and password" from the hub client;
+    we translate that into a readable :class:`TranscriptionError` so the failure
+    surfaces clearly to the user instead of looking like an auth problem.
+    """
+    try:
+        _load_models.load_model(model_id, dtype=mx.float16)
+    except (RepositoryNotFoundError, HFValidationError) as exc:
+        raise TranscriptionError(
+            f"Transcription model '{model_id}' was not found. Check the model "
+            "id in Settings — MLX Whisper models use the '-mlx' suffix "
+            "(e.g. mlx-community/whisper-small-mlx)."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - wrap anything else as a transcription failure
+        raise TranscriptionError(f"Failed to load transcription model '{model_id}': {exc}") from exc
 
 
 # The model id that was successfully warmed into MLX memory at startup. Used by
@@ -118,7 +112,7 @@ def warm_model() -> None:
 
     start = time.monotonic()
     try:
-        _load_models.load_model(model_id, dtype=mx.float16)
+        _load_model_safe(model_id)
         elapsed = time.monotonic() - start
         logger.info(
             "Whisper model '%s' loaded into MLX memory in %.1fs.", model_id, elapsed
@@ -143,12 +137,18 @@ def _hf_cache_has(model_id: str) -> bool:
         return False
 
 
-def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
+def transcribe(path: str, language: str | None = None, progress_callback=None) -> TranscriptionResult:
     """Transcribe an audio file at ``path`` and return text + timed segments.
 
     Runs the pluggable pre-audio-processing modules first (e.g. silence trim),
     then transcribes the (possibly transformed) audio with any tuned Whisper
     options. Temporary transformed files are cleaned up afterwards.
+
+    Args:
+        path: Path to the audio file.
+        language: Optional language code (e.g., "en"). Defaults to settings.
+        progress_callback: Optional callable(current_chunk, total_chunks) invoked
+            after each chunk is transcribed. Used to report progress for long audio.
     """
     settings = get_settings()
     lang = language or settings.transcription_language
@@ -158,13 +158,13 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
         logger.info("Using preloaded Whisper model '%s'.", model_id)
     else:
         # Either warm_model() didn't run/succeed, or the configured model
-        # changed; mlx_whisper will load (and cache) it on this call.
+        # changed; load (and cache) it now. Validating here surfaces a clear
+        # error for a missing/non-existent model id instead of letting the raw
+        # "Repository Not Found / 401" bubble up from the hub client.
         logger.info("Loading Whisper model '%s' for this request.", model_id)
+        _load_model_safe(model_id)
 
     processed_path = run_audio_transforms(path, settings)
-    # Reset segment-based progress for this call. The chunking helpers below
-    # declare the total and advance it per audio segment.
-    _set_segment_total(0)
     try:
         audio = _load_waveform(processed_path)
         if _needs_chunking(audio):
@@ -185,6 +185,7 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
                 result = _transcribe_vad_chunks(
                     audio, vad_chunks, model_id, lang,
                     collect_transcribe_options(settings),
+                    progress_callback,
                 )
             else:
                 logger.info(
@@ -194,10 +195,18 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
                     _CHUNK_SECONDS,
                 )
                 result = _transcribe_chunked(
-                    audio, model_id, lang, collect_transcribe_options(settings)
+                    audio, model_id, lang, collect_transcribe_options(settings),
+                    progress_callback,
                 )
         else:
-            _set_segment_total(1)
+            # Single-pass path: very short clips (under ~1s) often produce no
+            # usable audio for Whisper. Surface a clear error instead of letting
+            # the underlying call fail cryptically.
+            if len(audio) / 16000.0 < 0.5:
+                raise TranscriptionError(
+                    "Audio is too short to transcribe. Record at least a second "
+                    "of speech and try again."
+                )
             result = mlx_whisper.transcribe(
                 processed_path,
                 path_or_hf_repo=model_id,
@@ -206,12 +215,9 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
                 verbose=False,
                 **collect_transcribe_options(settings),
             )
-            _advance_segment()
+            if progress_callback:
+                progress_callback(1.0)
     finally:
-        # Capture the final progress (segment fraction) so the caller can
-        # record it, then clear it so a stale value isn't reported later.
-        final_progress = get_progress()
-        _set_segment_total(0)
         # Remove any temp file produced by the preprocessing chain, but never
         # the original uploaded audio.
         if processed_path != path and os.path.exists(processed_path):
@@ -232,7 +238,7 @@ def transcribe(path: str, language: str | None = None) -> TranscriptionResult:
     return TranscriptionResult(
         text=result.get("text", "").strip(),
         segments=segments,
-        progress=final_progress,
+        progress=1.0,  # transcription completed
     )
 
 
@@ -260,7 +266,8 @@ def _needs_chunking(audio: "mx.array") -> bool:
 
 
 def _transcribe_chunked(
-    audio: "mx.array", model_id: str, lang: str | None, options: dict
+    audio: "mx.array", model_id: str, lang: str | None, options: dict,
+    progress_callback=None,
 ) -> dict:
     """Transcribe long audio by decoding fixed windows and merging the results.
 
@@ -270,6 +277,9 @@ def _transcribe_chunked(
     what makes large models loop/hallucinate and bail early on long input, and we
     re-assemble the full transcript ourselves. Segment timestamps are shifted by
     each window's start offset so the merged timeline stays continuous.
+
+    If ``progress_callback`` is provided, it will be called with a float (0.0-1.0)
+    after each chunk is transcribed.
     """
     sr = 16000
     chunk_samples = _CHUNK_SECONDS * sr
@@ -286,9 +296,9 @@ def _transcribe_chunked(
     all_text: list[str] = []
     all_segments: list[dict] = []
     overlap_skip = float(_CHUNK_OVERLAP_SECONDS)
-    _set_segment_total(len(starts))
+    total_chunks = len(starts)
 
-    for start in starts:
+    for i, start in enumerate(starts):
         window = audio[start : start + chunk_samples]
         if window.shape[0] < sr:  # ignore sub-second tails
             continue
@@ -301,7 +311,8 @@ def _transcribe_chunked(
             condition_on_previous_text=False,
             **options,
         )
-        _advance_segment()
+        if progress_callback:
+            progress_callback((i + 1) / total_chunks)
         offset = start / sr
         window_segments = [
             s for s in chunk_result.get("segments", []) if s.get("end", 0.0) > overlap_skip
@@ -372,6 +383,7 @@ def _transcribe_vad_chunks(
     model_id: str,
     lang: str | None,
     options: dict,
+    progress_callback=None,
 ) -> dict:
     """Transcribe VAD-merged speech chunks with one Whisper call each.
 
@@ -379,15 +391,18 @@ def _transcribe_vad_chunks(
     and there is no overlap to dedupe. Segment timestamps are shifted by each
     chunk's start offset so the merged timeline stays continuous and matches the
     real audio clock.
+
+    If ``progress_callback`` is provided, it will be called with a float (0.0-1.0)
+    after each chunk is transcribed.
     """
     np_audio = np.asarray(audio, dtype=np.float32)
     sr = 16000
 
     all_text: list[str] = []
     all_segments: list[dict] = []
-    _set_segment_total(len(chunks))
+    total_chunks = len(chunks)
 
-    for start, end in chunks:
+    for i, (start, end) in enumerate(chunks):
         window = np_audio[start:end]
         if window.shape[0] < sr:  # ignore sub-second tails
             continue
@@ -400,7 +415,6 @@ def _transcribe_vad_chunks(
             condition_on_previous_text=False,
             **options,
         )
-        _advance_segment()
         offset = start / sr
         for seg in chunk_result.get("segments", []):
             all_segments.append(
@@ -413,6 +427,8 @@ def _transcribe_vad_chunks(
         text = chunk_result.get("text", "").strip()
         if text:
             all_text.append(text)
+        if progress_callback:
+            progress_callback((i + 1) / total_chunks)
 
     return {
         "text": " ".join(all_text),

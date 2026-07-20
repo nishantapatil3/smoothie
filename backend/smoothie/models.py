@@ -86,6 +86,7 @@ class JobStage(str, enum.Enum):
     SUMMARIZING = "summarizing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class Recording(Base):
@@ -165,12 +166,19 @@ class Job(Base):
     stage: Mapped[JobStage] = mapped_column(
         Enum(JobStage), default=JobStage.PENDING, nullable=False
     )
+    # Priority for job scheduling (higher = more urgent). Default 0.
+    priority: Mapped[int] = mapped_column(default=0, nullable=False)
     # Transcription progress as a fraction (0.0-1.0); meaningful while the
     # TRANSCRIBING stage is active. Summarizing has no native progress.
     progress: Mapped[float] = mapped_column(default=0.0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
+    )
+    # Job cancellation support
+    cancelled: Mapped[bool] = mapped_column(default=False, nullable=False)
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     recording: Mapped[Recording] = relationship(back_populates="job")

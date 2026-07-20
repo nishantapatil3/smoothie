@@ -1,16 +1,22 @@
 import { useRef, useState } from "react";
-import { uploadRecording } from "../api.js";
+import { useNavigate } from "react-router-dom";
+import { uploadRecording } from "../api";
+import { cn } from "../lib/utils";
 
-// Records from the microphone via MediaRecorder, or accepts an uploaded file.
-export default function Recorder({ onUploaded }) {
+interface RecorderProps {
+  onUploaded?: () => void;
+}
+
+export default function Recorder({ onUploaded }: RecorderProps) {
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-  const mediaRef = useRef(null);
-  const chunksRef = useRef([]);
+  const [error, setError] = useState("");
+  const navigate = useNavigate();
+  const mediaRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
 
   async function start() {
-    setError(null);
+    setError("");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mr = new MediaRecorder(stream);
@@ -26,7 +32,7 @@ export default function Recorder({ onUploaded }) {
       mr.start();
       mediaRef.current = mr;
       setRecording(true);
-    } catch (e) {
+    } catch {
       setError("Microphone access denied or unavailable.");
     }
   }
@@ -36,45 +42,51 @@ export default function Recorder({ onUploaded }) {
     setRecording(false);
   }
 
-  async function onFile(e) {
+  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (file) await send(file, file.name);
     e.target.value = "";
   }
 
-  async function send(blobOrFile, title) {
+  async function send(blobOrFile: Blob | File, title: string) {
     setBusy(true);
-    setError(null);
+    setError("");
     try {
-      const rec = await uploadRecording(blobOrFile, title);
-      onUploaded?.(rec);
-    } catch (e) {
-      setError(e.message);
+      await uploadRecording(blobOrFile as File, title);
+      // Prefer a caller-supplied callback (e.g. refresh the list in place);
+      // fall back to navigating to the recordings list when none is given.
+      if (onUploaded) {
+        onUploaded();
+      } else {
+        navigate("/recordings");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed");
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="recorder">
+    <div className="recorder flex flex-wrap items-center gap-2 mb-4">
       {!recording ? (
-        <button className="btn primary" onClick={start} disabled={busy}>
+        <button className={cn("btn btn-danger btn-small", busy && "opacity-70")} onClick={start} disabled={busy}>
           🎙️ Record
         </button>
       ) : (
-        <button className="btn danger" onClick={stop} disabled={busy}>
-          ⏹ Stop &amp; Upload
+        <button className={cn("btn btn-danger btn-small", busy && "opacity-70")} onClick={stop} disabled={busy}>
+          ⏹ Stop & Upload
         </button>
       )}
 
-      <label className="btn ghost">
+      <label className={cn("btn btn-small bg-blue-600 text-white hover:bg-blue-700 focus:ring-blue-500", busy && "opacity-70")}>
         📁 Upload file
         <input
           type="file"
           accept="audio/*"
           onChange={onFile}
           disabled={busy}
-          hidden
+          className="hidden"
         />
       </label>
 

@@ -1,6 +1,7 @@
 """Tests for the multi-user auth backend and per-user recording scoping."""
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -25,9 +26,17 @@ def client():
     db.async_session = db.async_sessionmaker(
         db.engine, expire_on_commit=False, class_=db.AsyncSession
     )
+    # Ensure tables exist and migrations run
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(db.init_db())
+    loop.close()
 
     with TestClient(app) as c:
         yield c
+
+    # cleanup
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _register(c, username="alice", password="password123"):

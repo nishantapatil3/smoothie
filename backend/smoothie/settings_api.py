@@ -107,7 +107,7 @@ async def update_settings(
     if not updates:
         return SettingsOut.model_validate(get_settings().model_dump())
     try:
-        updated = apply_settings(updates)
+        updated = await apply_settings(updates)
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"Invalid settings: {exc}")
     return SettingsOut.model_validate(updated.model_dump())

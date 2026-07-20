@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,10 +22,46 @@ from .storage import delete_audio
 from .summarize import SummaryError, get_provider
 from .transcription import TranscriptionError, transcribe, warm_model
 from .tiers import can_transcribe
+from .metrics import (
+    jobs_total,
+    job_duration_seconds,
+    queue_depth,
+    transcription_duration_seconds,
+    transcription_chunks,
+    audio_duration_seconds,
+    summarization_duration_seconds,
+    summarization_retries,
+    errors_total,
+    model_warmup_duration_seconds,
+    model_warmup_success,
+    model_warmup_failure,
+)
 
 logger = logging.getLogger("smoothie.tasks")
 
 _running = False
+
+# In-process pub/sub for live job progress. The SSE endpoint subscribes an
+# asyncio.Event per job; the worker signals it the moment it writes progress to
+# the DB, so clients receive updates instantly instead of waiting for the SSE
+# poll interval. Keyed by job id -> asyncio.Event (one-shot, reset each wait).
+_progress_subscribers: dict[int, asyncio.Event] = {}
+
+
+def subscribe_progress(job_id: int) -> asyncio.Event:
+    """Register (or return) the progress event for ``job_id``."""
+    ev = _progress_subscribers.get(job_id)
+    if ev is None:
+        ev = asyncio.Event()
+        _progress_subscribers[job_id] = ev
+    return ev
+
+
+def notify_progress(job_id: int) -> None:
+    """Wake any SSE subscriber waiting on ``job_id``."""
+    ev = _progress_subscribers.get(job_id)
+    if ev is not None:
+        ev.set()
 
 
 async def start_worker() -> None:
@@ -150,10 +187,49 @@ async def _process_one() -> None:
                 await session.commit()
 
                 path = str(_audio_path_for(recording.filename))
-                # mlx_whisper.transcribe is blocking; run it off the event loop.
+                transcribe_start = time.monotonic()
+                # mlx_whisper.transcribe is blocking; run it off the event loop
+                # via asyncio.to_thread. Its progress callback is invoked from
+                # that worker thread, so it must be a *synchronous* function.
+                # We bridge the async DB write back onto the event loop with
+                # run_coroutine_threadsafe. (Earlier this was an `async` callback
+                # called without await, so the coroutine was silently dropped and
+                # progress never reached the UI.)
+                loop = asyncio.get_running_loop()
+
+                def update_progress(current: float, total: int | None = None) -> None:
+                    # Whisper's single-pass path calls back with (current, total)
+                    # while the chunked/VAD paths pass a precomputed fraction;
+                    # normalize both to a 0.0-1.0 fraction.
+                    progress = current / total if total else current
+
+                    async def _persist() -> None:
+                        async with async_session() as s:
+                            j = await s.get(Job, job.id)
+                            if j:
+                                j.progress = progress
+                                await s.commit()
+                        notify_progress(job.id)
+
+                    asyncio.run_coroutine_threadsafe(_persist(), loop)
+
                 result = await asyncio.to_thread(
-                    transcribe, path, recording.language
+                    transcribe, path, recording.language, update_progress
                 )
+                transcribe_duration = time.monotonic() - transcribe_start
+
+                # Check if job was cancelled during transcription
+                async with async_session() as s:
+                    j = await s.get(Job, job.id)
+                    if j and j.cancelled:
+                        logger.info("Job %s was cancelled during transcription", job.id)
+                        return
+
+                # Record transcription metrics
+                transcription_duration_seconds.observe(transcribe_duration)
+                transcription_chunks.observe(len(result.segments))
+                if recording.duration_sec:
+                    audio_duration_seconds.observe(recording.duration_sec)
 
                 transcript = recording.transcript or Transcript(
                     recording_id=recording.id
@@ -162,7 +238,7 @@ async def _process_one() -> None:
                 transcript.segments = result.segments
                 session.add(transcript)
                 recording.duration_sec = _duration_from(result.segments)
-                job.progress = result.progress
+                job.progress = 1.0  # transcription complete
                 # Account the consumed transcription time against the lifetime
                 # budget. Truncate to whole minutes so the meter is predictable.
                 if owner is not None:
@@ -175,8 +251,13 @@ async def _process_one() -> None:
             recording.status = JobStage.SUMMARIZING
             await session.commit()
 
+            summarize_start = time.monotonic()
             provider = get_provider()
             summary_text = await provider.summarize(summary_text_in)
+            summarize_duration = time.monotonic() - summarize_start
+
+            # Record summarization metrics
+            summarization_duration_seconds.observe(summarize_duration)
 
             summary = recording.summary or Summary(recording_id=recording.id)
             summary.markdown = summary_text
@@ -188,7 +269,16 @@ async def _process_one() -> None:
             job.error = None
             await session.commit()
 
-        except Exception as exc:  # noqa: BLE001
+            # Record successful job metrics
+            jobs_total.labels(stage="total", status="completed").inc()
+            job_duration_seconds.labels(stage="total").observe(
+                time.monotonic() - transcribe_start if not resume_summary else summarize_duration
+            )
+
+        except SummaryError as exc:
+            logger.error("Summarization failed for job %s: %s", job.id, exc)
+            summarization_retries.inc()
+            errors_total.labels(component="summarizer", error_type="summarization_error").inc()
             await session.rollback()
             async with async_session() as s2:
                 j = await s2.get(Job, job.id)
@@ -199,7 +289,35 @@ async def _process_one() -> None:
                     if rec is not None:
                         rec.status = JobStage.FAILED
                     await s2.commit()
+            jobs_total.labels(stage="summarizing", status="failed").inc()
+        except TranscriptionError as exc:
+            logger.error("Transcription failed for job %s: %s", job.id, exc)
+            errors_total.labels(component="transcriber", error_type="transcription_error").inc()
+            await session.rollback()
+            async with async_session() as s2:
+                j = await s2.get(Job, job.id)
+                if j is not None:
+                    j.stage = JobStage.FAILED
+                    j.error = str(exc)[:2000]
+                    rec = await s2.get(Recording, recording.id)
+                    if rec is not None:
+                        rec.status = JobStage.FAILED
+                    await s2.commit()
+            jobs_total.labels(stage="transcribing", status="failed").inc()
+        except Exception as exc:  # noqa: BLE001
             logger.error("Job %s failed: %s", job.id, exc)
+            errors_total.labels(component="worker", error_type="other").inc()
+            await session.rollback()
+            async with async_session() as s2:
+                j = await s2.get(Job, job.id)
+                if j is not None:
+                    j.stage = JobStage.FAILED
+                    j.error = str(exc)[:2000]
+                    rec = await s2.get(Recording, recording.id)
+                    if rec is not None:
+                        rec.status = JobStage.FAILED
+                    await s2.commit()
+            jobs_total.labels(stage="unknown", status="failed").inc()
 
 
 async def _claim_pending(session: AsyncSession) -> Job | None:
@@ -207,6 +325,7 @@ async def _claim_pending(session: AsyncSession) -> Job | None:
         select(Job)
         .where(Job.stage.in_([JobStage.PENDING, JobStage.SUMMARIZING]))
         .with_for_update(skip_locked=True)
+        .order_by(Job.priority.desc(), Job.recording_id.asc())  # FIFO within same priority
         .limit(1)
     )
     result = await session.execute(stmt)

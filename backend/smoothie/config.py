@@ -8,6 +8,7 @@ settings can be updated at runtime via :func:`apply_settings` (persisted back to
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from functools import lru_cache
 from pathlib import Path
@@ -17,6 +18,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("smoothie")
+
+# Lock to protect concurrent settings mutations (e.g., simultaneous PUT /api/settings).
+_settings_lock = asyncio.Lock()
 
 # Project root: backend/ (this file lives in backend/smoothie/)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -85,7 +89,7 @@ class Settings(BaseModel):
     # tokens become invalid on every boot. If left empty, an ephemeral secret is
     # generated at startup (tokens won't survive a restart). Not exposed via the
     # UI for safety — set it in config.yaml directly.
-    auth_secret: str = ""
+    auth_secret: str = "changeme"
     # Access token lifetime in minutes (short-lived; refreshed silently).
     auth_access_ttl_minutes: int = 60
     # Refresh token lifetime in days (long-lived; rotated on each use).
@@ -166,25 +170,28 @@ def get_settings() -> Settings:
     return load_config()
 
 
-def apply_settings(updates: dict[str, Any]) -> Settings:
+async def apply_settings(updates: dict[str, Any]) -> Settings:
     """Update the cached settings in place, persist to ``config.yaml``, return it.
 
     ``updates`` is a partial dict of editable fields. Hidden fields
     (``auth_secret``, ``data_dir``, ``ffmpeg_bin``) and any unknown keys are
     ignored. Values are validated/coerced by the ``Settings`` model so e.g. a
     JSON boolean becomes a real ``bool``. Raises ``ValueError`` on invalid data.
+
+    This function is async and uses a lock to prevent concurrent mutations.
     """
-    settings = get_settings()
-    current = settings.model_dump()
-    for key, value in updates.items():
-        if key in HIDDEN_SETTINGS or key not in current:
-            continue
-        current[key] = value
-    # Re-validate the merged result (coerces types, rejects bad ones).
-    updated = Settings(**current)
-    # Mutate the cached singleton in place so existing get_settings() callers
-    # see the new values immediately.
-    for key, value in updated.model_dump().items():
-        setattr(settings, key, value)
-    save_config(settings)
-    return settings
+    async with _settings_lock:
+        settings = get_settings()
+        current = settings.model_dump()
+        for key, value in updates.items():
+            if key in HIDDEN_SETTINGS or key not in current:
+                continue
+            current[key] = value
+        # Re-validate the merged result (coerces types, rejects bad ones).
+        updated = Settings(**current)
+        # Mutate the cached singleton in place so existing get_settings() callers
+        # see the new values immediately.
+        for key, value in updated.model_dump().items():
+            setattr(settings, key, value)
+        save_config(settings)
+        return settings

@@ -1,6 +1,7 @@
 """Tests for subscription tiers, usage limits, and admin tier management."""
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -13,8 +14,27 @@ from smoothie.main import app
 from smoothie.tiers import can_transcribe, default_tier, is_valid_tier
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _init_db_first():
+    """Ensure database is initialized before any tests run."""
+    tmp = Path(tempfile.mkdtemp(prefix="smoothie-test-"))
+    settings = config_mod.get_settings()
+    settings.data_dir = tmp
+    settings.auth_secret = "test-secret"
+    db.engine = db.create_async_engine(settings.db_url, echo=False, future=True)
+    db.async_session = db.async_sessionmaker(
+        db.engine, expire_on_commit=False, class_=db.AsyncSession
+    )
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(db.init_db())
+    loop.close()
+    yield
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 @pytest.fixture
-def client():
+def client(_init_db_first):
     """App wired to a fresh sqlite DB (engine rebuilt per test)."""
     tmp = Path(tempfile.mkdtemp(prefix="smoothie-test-"))
     settings = config_mod.get_settings()
@@ -24,6 +44,11 @@ def client():
     db.async_session = db.async_sessionmaker(
         db.engine, expire_on_commit=False, class_=db.AsyncSession
     )
+    # Ensure tables exist and migrations run
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(db.init_db())
+    loop.close()
+
     with TestClient(app) as c:
         yield c
 

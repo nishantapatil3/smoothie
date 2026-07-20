@@ -9,11 +9,16 @@ name.
 from __future__ import annotations
 
 import abc
+import asyncio
+import logging
+import random
 
 import httpx
 
 from .config import get_settings
 from .prompts import SUMMARY_SYSTEM_PROMPT, build_summary_prompt
+
+logger = logging.getLogger("smoothie.summarize")
 
 
 class SummaryError(RuntimeError):
@@ -26,6 +31,40 @@ class SummaryProvider(abc.ABC):
     @abc.abstractmethod
     async def summarize(self, transcript: str) -> str:
         ...
+
+
+async def _retry_with_backoff(coro, max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 30.0):
+    """Execute a coroutine with exponential backoff retry on transient errors."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro()
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            last_exc = exc
+            if attempt == max_retries:
+                break
+            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 0.1), max_delay)
+            logger.warning(
+                "Summarizer request failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                attempt + 1, max_retries + 1, exc, delay
+            )
+            await asyncio.sleep(delay)
+        except httpx.HTTPStatusError as exc:
+            # Retry on 5xx server errors, but not on 4xx client errors
+            if 500 <= exc.response.status_code < 600:
+                last_exc = exc
+                if attempt == max_retries:
+                    break
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 0.1), max_delay)
+                logger.warning(
+                    "Summarizer returned %s (attempt %d/%d). Retrying in %.1fs...",
+                    exc.response.status_code, attempt + 1, max_retries + 1, delay
+                )
+                await asyncio.sleep(delay)
+            else:
+                # 4xx errors are not retryable
+                raise
+    raise last_exc
 
 
 class ApiEndpointProvider(SummaryProvider):
@@ -55,17 +94,22 @@ class ApiEndpointProvider(SummaryProvider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        try:
+        async def _do_request():
             async with httpx.AsyncClient(timeout=300.0) as client:
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
-                data = resp.json()
+                return resp.json()
+
+        try:
+            data = await _retry_with_backoff(_do_request)
         except httpx.ConnectError as exc:
             raise SummaryError(
                 f"Could not reach summarizer LLM at {url}. Is it running?"
             ) from exc
         except httpx.HTTPStatusError as exc:
             raise SummaryError(f"Summarizer LLM returned error: {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise SummaryError(f"Summarizer request timed out after retries") from exc
 
         try:
             return data["choices"][0]["message"]["content"].strip()

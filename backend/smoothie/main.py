@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import logging
+import sys
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, File, Form, HTTPException, Query, UploadFile
+import structlog
+from fastapi import FastAPI, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
@@ -14,7 +17,7 @@ from sqlalchemy.orm import selectinload
 from .config import get_settings
 from . import __version__
 from . import admin_api, auth, settings_api, transcription
-from .db import get_session, init_db
+from .db import async_session, get_session, init_db
 from .models import Job, JobStage, Recording, User
 from .tiers import UNLIMITED, can_transcribe
 from .schemas import (
@@ -26,29 +29,10 @@ from .schemas import (
 from .auth import get_current_user
 from .storage import audio_duration_sec, audio_path, delete_audio, save_audio
 from .tasks import reprocess, retry_summary, start_worker, stop_worker
+from .logging_config import configure_logging, set_request_id, clear_request_id
+from .metrics import metrics_response
 
-logger = logging.getLogger("smoothie")
-
-
-def configure_logging() -> None:
-    """Ensure Smoothie's loggers emit at INFO under uvicorn.
-
-    Uvicorn's default config sets the root logger to WARNING and only attaches
-    handlers to its own ``uvicorn.*`` loggers, so our ``smoothie.*`` INFO logs
-    (e.g. model warmup) would otherwise be dropped. Add a stderr handler to the
-    ``smoothie`` logger if it has none, and raise its level to INFO. This is
-    idempotent and coexists with uvicorn's handlers.
-    """
-    smoothie_logger = logging.getLogger("smoothie")
-    smoothie_logger.setLevel(logging.INFO)
-    if not smoothie_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        smoothie_logger.addHandler(handler)
-        # Don't propagate to root (which uvicorn leaves at WARNING); we handle it.
-        smoothie_logger.propagate = False
+logger = structlog.get_logger("smoothie")
 
 
 settings = get_settings()
@@ -57,6 +41,19 @@ app = FastAPI(title="Smoothie", version="0.1.0")
 
 # Directory that may contain the built web UI (repo-root webui/dist). Optional.
 UI_DIST = settings.data_dir.parent.parent / "webui" / "dist"
+
+
+# Request ID middleware for correlation
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
+    set_request_id(request_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        clear_request_id()
 
 
 @app.on_event("startup")
@@ -80,6 +77,12 @@ async def health() -> HealthOut:
         summary_url=settings.summary_url,
         summary_model=settings.summary_model,
     )
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return metrics_response()
 
 
 app.include_router(auth.router)
@@ -161,12 +164,9 @@ async def list_recordings(
             {c.name: getattr(r, c.name) for c in Recording.__table__.columns}
         )
         if r.job is not None:
-            # While actively transcribing, read the live progress hook so the
-            # sidebar bar advances; otherwise use the stored value.
-            if r.job.stage == JobStage.TRANSCRIBING:
-                item.progress = transcription.get_progress()
-            else:
-                item.progress = r.job.progress
+            # Use stored progress from the job; the transcription worker
+            # updates job.progress as it processes segments.
+            item.progress = r.job.progress
         items.append(item)
     return items
 
@@ -208,12 +208,9 @@ async def get_recording(
         item.summary_provider = recording.summary.provider
 
     if recording.job is not None:
-        # While actively transcribing, read the live progress hook so polling
-        # clients see the percentage advance; otherwise use the stored value.
-        if recording.job.stage == JobStage.TRANSCRIBING:
-            item.progress = transcription.get_progress()
-        else:
-            item.progress = recording.job.progress
+        # Use stored progress from the job; the transcription worker
+        # updates job.progress as it processes segments.
+        item.progress = recording.job.progress
         item.error = recording.job.error
 
     return item
@@ -269,6 +266,138 @@ async def get_audio(
     if not path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing.")
     return FileResponse(str(path), media_type=recording.content_type or "audio/webm")
+
+
+@app.delete("/api/recordings/{recording_id}/job", status_code=200)
+async def cancel_recording_job(
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Cancel a running job for a recording.
+
+    Only works if the job is in PENDING, TRANSCRIBING, or SUMMARIZING stage.
+    Returns the updated job status.
+    """
+    recording = await session.get(Recording, recording_id)
+    if recording is None or recording.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    job = recording.job
+    if job is None:
+        raise HTTPException(status_code=404, detail="No job associated with this recording.")
+
+    if job.stage not in (JobStage.PENDING, JobStage.TRANSCRIBING, JobStage.SUMMARIZING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot cancel job in {job.stage.value} stage.",
+        )
+
+    from datetime import datetime, timezone
+    job.cancelled = True
+    job.cancelled_at = datetime.now(timezone.utc)
+    job.stage = JobStage.CANCELLED
+    job.error = "Job cancelled by user"
+    recording.status = JobStage.CANCELLED
+    await session.commit()
+
+    return {"ok": True, "status": "cancelled", "message": "Job cancelled successfully"}
+
+
+@app.get("/api/recordings/{recording_id}/events")
+async def recording_events(
+    recording_id: str,
+    request: Request,
+    token: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    """Server-Sent Events endpoint for real-time job progress updates.
+
+    Streams job progress updates as they happen. The client receives events
+    with the current job stage, progress percentage, and any error messages.
+
+    Accepts auth token either as Bearer header or ?token= query parameter
+    (for EventSource compatibility which doesn't support custom headers).
+    """
+    # Try to authenticate via token query param (for EventSource) or Bearer header
+    user = None
+    auth_token = token
+
+    # If no query param token, try to extract from Authorization header
+    if not auth_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            auth_token = auth_header[7:]  # Remove "Bearer " prefix
+
+    if auth_token:
+        user_id = auth.verify_token(auth_token)
+        if user_id:
+            user = await session.get(User, user_id)
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    recording = (
+        await session.execute(
+            select(Recording)
+            .where(Recording.id == recording_id)
+            .options(selectinload(Recording.job))
+        )
+    ).scalar_one_or_none()
+    if recording is None or recording.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    job = recording.job
+    if job is None:
+        raise HTTPException(status_code=404, detail="No job associated with this recording.")
+
+    async def event_generator():
+        import asyncio
+        last_progress = -1.0
+        last_stage = None
+        last_error = None
+
+        while True:
+            # Refresh job from DB
+            async with async_session() as s:
+                j = await s.get(Job, job.id)
+                if j is None:
+                    break
+                current_progress = j.progress
+                current_stage = j.stage.value if j.stage else None
+                current_error = j.error
+
+                # Only send if something changed
+                if (current_progress != last_progress or
+                    current_stage != last_stage or
+                    current_error != last_error):
+                    import json
+                    data = {
+                        "stage": current_stage,
+                        "progress": current_progress,
+                        "error": current_error,
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    last_progress = current_progress
+                    last_stage = current_stage
+                    last_error = current_error
+
+                # Stop if job is in a terminal state
+                if current_stage in ("completed", "failed", "cancelled"):
+                    break
+
+            await asyncio.sleep(0.5)  # Poll every 500ms
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 # --- Static UI serving (production: build the webui into webui/dist) ---
