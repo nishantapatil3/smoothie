@@ -3,6 +3,10 @@ from __future__ import annotations
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
 # Job metrics
 jobs_total = Counter(
     "smoothie_jobs_total",
@@ -115,4 +119,5 @@ model_warmup_failure = Counter(
 def metrics_response():
     """Generate Prometheus metrics response."""
     from fastapi import Response
+    logger.debug("Generating metrics response")
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

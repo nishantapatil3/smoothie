@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 import smoothie.config as config_mod
 from smoothie import db
 from smoothie.main import app
 from smoothie.tiers import can_transcribe, default_tier, is_valid_tier
+from smoothie.models import Job, JobStage, Recording, Transcript, Summary, User
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -160,6 +162,29 @@ def test_admin_can_list_and_change_tier(client):
     assert bad.status_code == 422
 
 
+def test_admin_can_search_users_by_username(client):
+    config_mod.get_settings().admin_usernames = ["admin"]
+    admin = _register(client, "admin")["token"]
+    _register(client, "alice")
+    _register(client, "bob")
+
+    hdr = _auth_header(admin)
+
+    # A search term filters to matching usernames (case-insensitive substring).
+    names = {u["username"] for u in client.get("/api/admin/users?q=ali", headers=hdr).json()}
+    assert names == {"alice"}
+
+    # Case-insensitive.
+    names = {u["username"] for u in client.get("/api/admin/users?q=BO", headers=hdr).json()}
+    assert names == {"bob"}
+
+    # No match -> empty list.
+    assert client.get("/api/admin/users?q=zzz", headers=hdr).json() == []
+
+    # LIKE wildcards in the term are treated literally, not as patterns.
+    assert client.get("/api/admin/users?q=%25", headers=hdr).json() == []
+
+
 def test_non_admin_cannot_change_tier(client):
     config_mod.get_settings().admin_usernames = ["admin"]
     _register(client, "admin")
@@ -200,7 +225,9 @@ def test_worker_blocks_free_user_over_limit(client, monkeypatch):
         name = "stub"
 
         async def summarize(self, text):
-            return "summary"
+            from smoothie.summarize import SummaryResult
+
+            return SummaryResult(title="Test Meeting", summary="summary")
 
     monkeypatch.setattr(tasks, "transcribe", fake_transcribe)
     monkeypatch.setattr(tasks, "get_provider", lambda: _StubProvider())
@@ -278,7 +305,9 @@ def test_retry_summary_reuses_transcript(client, monkeypatch):
 
         async def summarize(self, text):
             self.calls += 1
-            return f"summary of: {text}"
+            from smoothie.summarize import SummaryResult
+
+            return SummaryResult(title="Retry Title", summary=f"summary of: {text}")
 
     stub = _StubProvider()
     monkeypatch.setattr(tasks, "transcribe", fake_transcribe)
@@ -369,6 +398,257 @@ def test_retry_summary_409_without_transcript(client):
         loop.close()
 
     assert res.status_code == 409
+
+
+# --- Auto-titled recording (generated_title) -------------------------------- #
+def test_generated_title_set_and_surfaced(client, monkeypatch):
+    """After summarization, the LLM-produced short title is stored on
+    generated_title and surfaced by both the list and detail endpoints, while
+    the user's original (filename) title is left untouched."""
+    import asyncio
+
+    import smoothie.tasks as tasks
+
+    tasks.async_session = db.async_session
+    loop0 = asyncio.new_event_loop()
+    loop0.run_until_complete(tasks.stop_worker())
+    loop0.close()
+
+    def fake_transcribe(path, language, update_progress=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            text="we discussed the quarterly roadmap", segments=[], progress=1.0
+        )
+
+    class _StubProvider:
+        name = "stub"
+
+        async def summarize(self, text):
+            from smoothie.summarize import SummaryResult
+
+            return SummaryResult(
+                title="Quarterly Roadmap Discussion",
+                summary="summary of the roadmap",
+            )
+
+    monkeypatch.setattr(tasks, "transcribe", fake_transcribe)
+    monkeypatch.setattr(tasks, "get_provider", lambda: _StubProvider())
+
+    token = _register(client, "alice")["token"]
+    alice_id = client.get("/api/auth/me", headers=_auth_header(token)).json()["id"]
+
+    from smoothie.models import Job, JobStage, Recording, User
+
+    async def _setup():
+        await tasks.stop_worker()
+        async with db.async_session() as s:
+            u = await s.get(User, alice_id)
+            rec = Recording(
+                id="rec_title", user_id=alice_id, title="meeting.webm",
+                filename="meeting.webm", content_type="audio/webm",
+            )
+            s.add(rec)
+            s.add(Job(recording_id="rec_title", stage=JobStage.PENDING))
+            await s.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_setup())
+        loop.run_until_complete(tasks._process_one())
+    finally:
+        loop.close()
+
+    # Detail endpoint: original title preserved, generated_title present.
+    detail = client.get(
+        f"/api/recordings/rec_title", headers=_auth_header(token)
+    ).json()
+    assert detail["title"] == "meeting.webm"
+    assert detail["generated_title"] == "Quarterly Roadmap Discussion"
+
+    # List endpoint surfaces generated_title too.
+    listing = client.get("/api/recordings", headers=_auth_header(token)).json()
+    item = next(r for r in listing if r["id"] == "rec_title")
+    assert item["generated_title"] == "Quarterly Roadmap Discussion"
+
+
+def test_regenerate_title_endpoint(client, monkeypatch):
+    """The regenerate-title endpoint derives a fresh short title from the
+    existing summary (no re-transcribe), using the title-only provider path."""
+    import asyncio
+
+    import smoothie.tasks as tasks
+
+    tasks.async_session = db.async_session
+    loop0 = asyncio.new_event_loop()
+    loop0.run_until_complete(tasks.stop_worker())
+    loop0.close()
+
+    def fake_transcribe(path, language, update_progress=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(text="final transcript text", segments=[], progress=1.0)
+
+    class _StubProvider:
+        name = "stub"
+
+        async def summarize(self, text):
+            from smoothie.summarize import SummaryResult
+
+            return SummaryResult(title="Old Title", summary="the stored summary")
+
+        async def generate_title(self, summary):
+            return "Fresh Regenerated Title"
+
+    monkeypatch.setattr(tasks, "transcribe", fake_transcribe)
+    monkeypatch.setattr(tasks, "get_provider", lambda: _StubProvider())
+
+    token = _register(client, "alice")["token"]
+    alice_id = client.get("/api/auth/me", headers=_auth_header(token)).json()["id"]
+
+    from smoothie.models import Job, JobStage, Recording, Summary, User
+
+    async def _setup():
+        await tasks.stop_worker()
+        async with db.async_session() as s:
+            u = await s.get(User, alice_id)
+            rec = Recording(
+                id="rec_retitle", user_id=alice_id, title="meeting2.webm",
+                filename="meeting2.webm", content_type="audio/webm",
+            )
+            s.add(rec)
+            s.add(Summary(recording_id="rec_retitle", markdown="the stored summary"))
+            s.add(Job(recording_id="rec_retitle", stage=JobStage.COMPLETED))
+            await s.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_setup())
+        res = client.post(
+            f"/api/recordings/rec_retitle/regenerate-title",
+            headers=_auth_header(token),
+        )
+        assert res.status_code == 200
+        assert res.json()["generated_title"] == "Fresh Regenerated Title"
+
+        detail = client.get(
+            f"/api/recordings/rec_retitle", headers=_auth_header(token)
+        ).json()
+        assert detail["generated_title"] == "Fresh Regenerated Title"
+        # User's original title is untouched.
+        assert detail["title"] == "meeting2.webm"
+    finally:
+        loop.close()
+
+
+def test_regenerate_title_409_without_summary(client):
+    """Regenerate-title returns 409 when the recording has no summary yet."""
+    import asyncio
+
+    import smoothie.tasks as tasks
+
+    tasks.async_session = db.async_session
+    loop0 = asyncio.new_event_loop()
+    loop0.run_until_complete(tasks.stop_worker())
+    loop0.close()
+
+    token = _register(client, "alice")["token"]
+    alice_id = client.get("/api/auth/me", headers=_auth_header(token)).json()["id"]
+
+    from smoothie.models import Job, JobStage, Recording, User
+
+    async def _setup():
+        await tasks.stop_worker()
+        async with db.async_session() as s:
+            u = await s.get(User, alice_id)
+            rec = Recording(
+                id="rec_notitle", user_id=alice_id, filename="a.webm",
+                content_type="audio/webm",
+            )
+            s.add(rec)
+            s.add(Job(recording_id="rec_notitle", stage=JobStage.PENDING))
+            await s.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_setup())
+        res = client.post(
+            f"/api/recordings/rec_notitle/regenerate-title",
+            headers=_auth_header(token),
+        )
+        assert res.status_code == 409
+    finally:
+        loop.close()
+
+
+def test_reprocess_endpoint(client, monkeypatch):
+    """Reprocess resets the job to PENDING so the worker will re-transcribe
+    and re-summarize (full rerun)."""
+    import asyncio
+
+    import smoothie.tasks as tasks
+
+    tasks.async_session = db.async_session
+    loop0 = asyncio.new_event_loop()
+    loop0.run_until_complete(tasks.stop_worker())
+    loop0.close()
+
+    def fake_transcribe(path, language, update_progress=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(text="second transcript", segments=[], progress=1.0)
+
+    class _StubProvider:
+        name = "stub"
+
+        async def summarize(self, text):
+            from smoothie.summarize import SummaryResult
+
+            return SummaryResult(title="Second Title", summary="second summary")
+
+    monkeypatch.setattr(tasks, "transcribe", fake_transcribe)
+    monkeypatch.setattr(tasks, "get_provider", lambda: _StubProvider())
+
+    token = _register(client, "alice")["token"]
+    alice_id = client.get("/api/auth/me", headers=_auth_header(token)).json()["id"]
+
+    from smoothie.models import Job, JobStage, Recording, Transcript, Summary, User
+
+    async def _setup():
+        await tasks.stop_worker()
+        async with db.async_session() as s:
+            u = await s.get(User, alice_id)
+            # Simulate a completed job we want to redo
+            rec = Recording(
+                id="rec_reproc", user_id=alice_id, title="first.webm",
+                filename="first.webm", content_type="audio/webm",
+            )
+            s.add(rec)
+            s.add(Transcript(recording_id="rec_reproc", full_text="first transcript"))
+            s.add(Summary(recording_id="rec_reproc", markdown="first summary"))
+            s.add(Job(recording_id="rec_reproc", stage=JobStage.COMPLETED))
+            await s.commit()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_setup())
+        resp = client.post(
+            f"/api/recordings/rec_reproc/reprocess",
+            headers=_auth_header(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+
+        # Now check via the GET endpoint
+        get_resp = client.get(
+            f"/api/recordings/rec_reproc",
+            headers=_auth_header(token),
+        )
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        assert data["status"] == "pending"  # recording status
+    finally:
+        loop.close()
 
 
 # --- Upload gate: reject audio longer than remaining budget ----------------- #

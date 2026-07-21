@@ -7,6 +7,9 @@ import uuid
 from pathlib import Path
 
 from .config import get_settings
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def save_audio(data: bytes, content_type: str | None) -> tuple[str, str]:
@@ -15,6 +18,7 @@ def save_audio(data: bytes, content_type: str | None) -> tuple[str, str]:
     filename = f"{uuid.uuid4().hex}{ext}"
     path = get_settings().audio_dir / filename
     path.write_bytes(data)
+    logger.debug("Saved audio file: %s (size: %d bytes)", filename, len(data))
     return filename, str(path)
 
 
@@ -26,6 +30,7 @@ def delete_audio(filename: str) -> None:
     path = audio_path(filename)
     try:
         path.unlink()
+        logger.debug("Deleted audio file: %s", filename)
     except FileNotFoundError:
         pass
 

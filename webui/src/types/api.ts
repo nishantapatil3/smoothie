@@ -27,6 +27,7 @@ export type JobStage = "pending" | "transcribing" | "summarizing" | "completed" 
 export interface RecordingListItem {
   id: string;
   title: string | null;
+  generated_title: string | null;
   status: JobStage;
   language: string | null;
   duration_sec: number | null;
@@ -41,6 +42,19 @@ export interface RecordingDetail extends Recording {
   summary_provider: string | null;
   progress: number;
   error: string | null;
+}
+
+export interface Recording {
+  id: string;
+  user_id: string;
+  title: string | null;
+  generated_title: string | null;
+  filename: string;
+  content_type: string | null;
+  language: string | null;
+  duration_sec: number | null;
+  created_at: string;
+  status: JobStage;
 }
 
 export interface Segment {
@@ -133,4 +147,5 @@ export interface SSEEvent {
   stage: JobStage | null;
   progress: number;
   error: string | null;
+  generated_title: string | null;
 }

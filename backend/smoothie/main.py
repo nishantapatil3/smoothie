@@ -1,8 +1,6 @@
 """FastAPI application: recording upload, status, and static UI serving."""
 from __future__ import annotations
 
-import logging
-import sys
 import uuid
 from pathlib import Path
 
@@ -28,11 +26,11 @@ from .schemas import (
 )
 from .auth import get_current_user
 from .storage import audio_duration_sec, audio_path, delete_audio, save_audio
-from .tasks import reprocess, retry_summary, start_worker, stop_worker
-from .logging_config import configure_logging, set_request_id, clear_request_id
+from .tasks import regenerate_title, reprocess, retry_summary, start_worker, stop_worker
+from .logging_config import configure_logging, set_request_id, clear_request_id, get_logger
 from .metrics import metrics_response
 
-logger = structlog.get_logger("smoothie")
+logger = get_logger(__name__)
 
 
 settings = get_settings()
@@ -43,11 +41,12 @@ app = FastAPI(title="Smoothie", version="0.1.0")
 UI_DIST = settings.data_dir.parent.parent / "webui" / "dist"
 
 
-# Request ID middleware for correlation
+# Request ID middleware for logging method and endpoint
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
     set_request_id(request_id)
+    logger.info(f"{request.method} {request.url.path}")
     try:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -59,13 +58,18 @@ async def add_request_id(request: Request, call_next):
 @app.on_event("startup")
 async def _startup() -> None:
     configure_logging()
+    logger.info("Application starting up")
     await init_db()
+    logger.info("Database initialized")
     await start_worker()
+    logger.info("Background worker started")
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    logger.info("Application shutting down")
     await stop_worker()
+    logger.info("Background worker stopped")
 
 
 @app.get("/api/health", response_model=HealthOut)
@@ -253,6 +257,48 @@ async def retry_recording_summary(
     return {"ok": True, "status": "summarizing"}
 
 
+@app.post("/api/recordings/{recording_id}/regenerate-title", status_code=200)
+async def regenerate_recording_title(
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Regenerate the short title from the recording's existing summary.
+
+    Title-only (no re-transcribe / re-summarize). Returns 404 if the recording
+    doesn't belong to the caller, and 409 if it has no summary yet (run a full
+    summary first).
+    """
+    recording = await session.get(Recording, recording_id)
+    if recording is None or recording.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    title = await regenerate_title(recording_id)
+    if title is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No summary to derive a title from yet. Generate a summary first.",
+        )
+    return {"ok": True, "generated_title": title}
+
+
+@app.post("/api/recordings/{recording_id}/reprocess", status_code=200)
+async def reprocess_recording(
+    recording_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Reset the job to PENDING so the worker will re-transcribe and re-summarize.
+
+    Equivalent to a full retry; title/regeneration will be recomputed from the
+    new transcript. Returns 404 if the recording doesn't belong to the caller.
+    """
+    recording = await session.get(Recording, recording_id)
+    if recording is None or recording.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    await reprocess(recording_id)
+    return {"ok": True, "status": "pending"}
+
+
 @app.get("/api/recordings/{recording_id}/audio")
 async def get_audio(
     recording_id: str,
@@ -356,6 +402,7 @@ async def recording_events(
         last_progress = -1.0
         last_stage = None
         last_error = None
+        last_title = None
 
         while True:
             # Refresh job from DB
@@ -366,21 +413,28 @@ async def recording_events(
                 current_progress = j.progress
                 current_stage = j.stage.value if j.stage else None
                 current_error = j.error
+                # The generated title appears when summarization completes; fetch
+                # it so the list view can update its label live without a reload.
+                rec = await s.get(Recording, job.recording_id)
+                current_title = rec.generated_title if rec is not None else None
 
                 # Only send if something changed
                 if (current_progress != last_progress or
                     current_stage != last_stage or
-                    current_error != last_error):
+                    current_error != last_error or
+                    current_title != last_title):
                     import json
                     data = {
                         "stage": current_stage,
                         "progress": current_progress,
                         "error": current_error,
+                        "generated_title": current_title,
                     }
                     yield f"data: {json.dumps(data)}\n\n"
                     last_progress = current_progress
                     last_stage = current_stage
                     last_error = current_error
+                    last_title = current_title
 
                 # Stop if job is in a terminal state
                 if current_stage in ("completed", "failed", "cancelled"):

@@ -3,9 +3,8 @@ import { useParams, useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getRecording, deleteRecording, retrySummary, regenerateTitle, reprocessRecording, onRecordingEvents } from "../api";
-import type { RecordingDetail, SSEEvent, Segment } from "../types/api";
+import type { RecordingDetail, SSEEvent, Segment, JobStage } from "../types/api";
 
-const STAGES = ["pending", "transcribing", "summarizing", "completed"] as const;
 import { cn, fmtTime } from "../lib/utils";
 
 function TranscriptView() {
@@ -13,11 +12,10 @@ function TranscriptView() {
   const navigate = useNavigate();
   const [recording, setRecording] = useState<RecordingDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [retrying, setRetrying] = useState(false);
-  const [retryError, setRetryError] = useState("");
-  const [retitling, setRetitling] = useState(false);
-  const [retitleError, setRetitleError] = useState("");
-  const [rerunning, setRerunning] = useState(false);
+  // Which workflow step is currently re-running (null when idle). A per-step
+  // marker — rather than a single boolean — so only the clicked step shows the
+  // spinner and the others don't look like they're all re-running too.
+  const [rerunningStep, setRerunningStep] = useState<string | null>(null);
   const [rerunError, setRerunError] = useState("");
   const sseCleanupRef = useRef<(() => void) | null>(null);
 
@@ -107,28 +105,19 @@ function TranscriptView() {
   if (!recording) return <div className="detail">Not found.</div>;
   const rec = recording;
 
-  // Determine the workflow steps
-  let workflowSteps = ["pending", "transcribing", "summarizing"];
-  if (rec.summary) {
-    workflowSteps = [...workflowSteps, "regenerate title", "completed"];
-  } else {
-    workflowSteps = [...workflowSteps, "completed"];
-  }
+  // Determine the workflow steps - always show all steps in the pipeline
+  const workflowSteps = ["pending", "transcribing", "summarizing", "regenerate title", "completed"];
 
-  // Determine the current index in the workflowSteps array
-  let currentIndex;
-  if (rec.status === "completed") {
-    currentIndex = workflowSteps.length - 1;
-  } else {
-    const statusIndexMap = {
-      pending: 0,
-      transcribing: 1,
-      summarizing: 2
-    };
-    currentIndex = statusIndexMap[rec.status];
-  }
-
-  return (
+  // Determine the current index in the workflowSteps array. Only the in-flight
+  // stages map to a step; failed/cancelled fall through to 0 (the workflow box
+  // isn't rendered for those statuses anyway).
+  const statusIndexMap: Partial<Record<JobStage, number>> = {
+    pending: 0,
+    transcribing: 1,
+    summarizing: 2,
+  };
+  const currentIndex =
+    rec.status === "completed" ? workflowSteps.length - 1 : statusIndexMap[rec.status] ?? 0;
 
   async function handleDelete() {
     if (!confirm(`Delete "${rec.title || "this recording"}"?`)) return;
@@ -136,48 +125,50 @@ function TranscriptView() {
     navigate("/recordings");
   }
 
-  async function handleRetrySummary() {
-    setRetrying(true);
-    setRetryError("");
-    try {
-      await retrySummary(rec.id);
-    } catch (err: unknown) {
-      setRetryError(err instanceof Error ? err.message : "Retry failed");
-    } finally {
-      setRetrying(false);
-    }
-  }
-
-  async function handleRegenerateTitle() {
-    setRetitling(true);
-    setRetitleError("");
-    try {
-      const data = await regenerateTitle(rec.id);
-      setRecording((prev) => (prev ? { ...prev, generated_title: data.generated_title } : prev));
-    } catch (err: unknown) {
-      setRetitleError(err instanceof Error ? err.message : "Title regeneration failed");
-      // Refresh so a 409 (no summary) surfaces the real state.
-      loadRecording();
-    } finally {
-      setRetitling(false);
-    }
-  }
-
-  async function handleReprocess() {
-    setRerunning(true);
-    setRerunError("");
-    try {
-      await reprocessRecording(rec.id);
-      // Optimistic UI: move to pending immediately.
-      setRecording((prev) => (prev ? { ...prev, status: "pending", progress: 0.0, error: null } : prev));
-    } catch (err: unknown) {
-      setRerunError(err instanceof Error ? err.message : "Reprocess failed");
-      // Refresh so a 404/409 surfaces the real state.
-      loadRecording();
-    } finally {
-      setRerunning(false);
-    }
-  }
+  // Per-step re-run. Each entry re-runs ONLY its own step and declares the
+  // prerequisite that must already be satisfied — so a re-run can never quietly
+  // kick off the steps before it. `ready: false` disables the button with a
+  // hint instead of firing a request the backend would reject with a 409.
+  //
+  //   transcribing      -> full reprocess. It's the first real step, and a
+  //                        fresh transcript necessarily invalidates the summary
+  //                        and title, so re-running it re-runs everything after.
+  //   summarizing       -> summary (+ title) only; reuses the existing
+  //                        transcript. Needs a transcript.
+  //   regenerate title  -> title only, from the existing summary. Needs a
+  //                        summary. Does NOT touch transcription or summary.
+  const rerunConfig: Record<
+    string,
+    { run: () => Promise<void>; ready: boolean; blockedHint: string; note: string }
+  > = {
+    transcribing: {
+      run: async () => {
+        await reprocessRecording(rec.id);
+        setRecording((prev) => (prev ? { ...prev, status: "pending", progress: 0.0, error: null } : prev));
+      },
+      ready: true,
+      blockedHint: "",
+      note: "Re-transcribe (also re-summarizes and re-titles)",
+    },
+    summarizing: {
+      run: async () => {
+        await retrySummary(rec.id);
+        setRecording((prev) => (prev ? { ...prev, status: "summarizing", error: null } : prev));
+      },
+      ready: !!rec.full_text,
+      blockedHint: "Transcribe first",
+      note: "Re-summarize from the existing transcript",
+    },
+    "regenerate title": {
+      run: async () => {
+        const data = await regenerateTitle(rec.id);
+        setRecording((prev) => (prev ? { ...prev, generated_title: data.generated_title } : prev));
+      },
+      ready: !!rec.summary,
+      blockedHint: "Summarize first",
+      note: "Regenerate the title from the existing summary",
+    },
+  };
 
   return (
     <div className="detail">
@@ -187,31 +178,6 @@ function TranscriptView() {
           🗑 Delete
         </button>
       </div>
-
-      {recording.summary && (
-        <section className="card mt-4">
-          <div className="box">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-lg font-semibold">Summary</h3>
-              <button
-                className="btn btn-secondary btn-small"
-                onClick={handleRegenerateTitle}
-                disabled={retitling}
-                title="Regenerate the short title from this summary"
-              >
-                {retitling ? "Regenerating…" : "↻ Regenerate title"}
-              </button>
-            </div>
-            <div className="markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{recording.summary}</ReactMarkdown>
-            </div>
-            {recording.summary_provider && (
-              <div className="muted small mt-2">via {recording.summary_provider}</div>
-            )}
-            {retitleError && <div className="muted small mt-2 text-red-600">{retitleError}</div>}
-          </div>
-        </section>
-      )}
 
       {["pending", "transcribing", "summarizing", "completed"].includes(recording.status) && (
         <div className="workflow box">
@@ -247,34 +213,50 @@ function TranscriptView() {
                     <span className={cn("workflow-line", done && "done")} />
                   )}
                 </div>
-                <button
-                  className="btn btn-ghost"
-                  onClick={async () => {
-                    setRerunning(true);
-                    setRerunError("");
-                    try {
-                      if (step === "pending" || step === "transcribing" || step === "completed") {
-                        await reprocessRecording(rec.id); // full rerun
-                      } else if (step === "summarizing") {
-                        await retrySummary(rec.id); // resume summarization
-                      } else if (step === "regenerate title") {
-                        await regenerateTitle(rec.id); // regenerate title
+                {rerunConfig[step] && (
+                  <button
+                    className="btn btn-ghost"
+                    onClick={async () => {
+                      setRerunningStep(step);
+                      setRerunError("");
+                      try {
+                        await rerunConfig[step].run();
+                      } catch (err: unknown) {
+                        setRerunError(err instanceof Error ? err.message : "Rerun failed");
+                        // Refresh so a 404/409 (missing prerequisite) surfaces
+                        // the real state instead of a stale optimistic one.
+                        loadRecording();
+                      } finally {
+                        setRerunningStep(null);
                       }
-                    } catch (err: unknown) {
-                      setRerunError(err instanceof Error ? err.message : "Rerun failed");
-                    } finally {
-                      setRerunning(false);
-                    }
-                  }}
-                  disabled={rerunning}
-                  title={`Rerun from ${step}`}
-                >
-                  {rerunning ? "Rerunning…" : `Re-run ${step}`}
-                </button>
+                    }}
+                    // Disabled while any step is re-running (no concurrent runs)
+                    // or when this step's prerequisite isn't met yet.
+                    disabled={rerunningStep !== null || !rerunConfig[step].ready}
+                    title={rerunConfig[step].ready ? rerunConfig[step].note : rerunConfig[step].blockedHint}
+                  >
+                    {rerunningStep === step ? "Rerunning…" : "↻ Re-run"}
+                  </button>
+                )}
               </div>
             );
           })}
+          {rerunError && <div className="muted small mt-2 text-red-600">{rerunError}</div>}
         </div>
+      )}
+
+      {recording.summary && (
+        <section className="card mt-4">
+          <div className="box">
+            <h3 className="text-lg font-semibold mb-2">Summary</h3>
+            <div className="markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{recording.summary}</ReactMarkdown>
+            </div>
+            {recording.summary_provider && (
+              <div className="muted small mt-2">via {recording.summary_provider}</div>
+            )}
+          </div>
+        </section>
       )}
 
       <section className="mt-4">

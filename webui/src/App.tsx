@@ -5,6 +5,7 @@ import AppLayout from "./components/AppLayout";
 import RecordingsList from "./components/RecordingsList";
 import TranscriptView from "./components/TranscriptView";
 import Settings from "./components/Settings";
+import Subscriptions from "./components/Subscriptions";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,6 +25,7 @@ function AppRoutes() {
         <Route path="/recordings" element={<RecordingsList />} />
         <Route path="/recordings/:id" element={<TranscriptView />} />
         <Route path="/settings" element={<Settings onTierChanged={() => {}} />} />
+        <Route path="/subscriptions" element={<Subscriptions onTierChanged={() => {}} />} />
       </Route>
     </Routes>
   );

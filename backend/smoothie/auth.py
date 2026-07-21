@@ -14,7 +14,6 @@ import binascii
 import hashlib
 import hmac
 import json
-import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -28,10 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .db import get_session
+from .logging_config import get_logger
 from .models import RefreshToken, User
 from .tiers import default_tier
 
-logger = logging.getLogger("smoothie")
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 

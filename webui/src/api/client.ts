@@ -1,4 +1,5 @@
 import { VITE_API_BASE_URL } from "./config";
+import type { AdminUser } from "../types/api";
 
 const API_BASE = VITE_API_BASE_URL || "/api";
 
@@ -138,19 +139,20 @@ export async function saveSettings(updates: Record<string, unknown>) {
 }
 
 // Admin
-export async function listUsers() {
-  const res = await authedFetch(`${API_BASE}/admin/users`);
+export async function listUsers(query?: string): Promise<AdminUser[]> {
+  const qs = query ? `?q=${encodeURIComponent(query)}` : "";
+  const res = await authedFetch(`${API_BASE}/admin/users${qs}`);
   if (!res.ok) throw new Error("Failed to list users");
   return res.json();
 }
 
-export async function setUserTier(userId: string, tier: string) {
+export async function setUserTier(userId: string, tier: string): Promise<AdminUser> {
   const res = await authedFetch(`${API_BASE}/admin/users/${userId}/tier`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tier }),
   });
-  if (!res.ok) throw new Error("Failed to set tier");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to set tier");
   return res.json();
 }
 
@@ -187,6 +189,18 @@ export async function deleteRecording(id: string) {
 export async function retrySummary(id: string) {
   const res = await authedFetch(`${API_BASE}/recordings/${id}/retry-summary`, { method: "POST" });
   if (!res.ok) throw new Error("Retry failed");
+  return res.json();
+}
+
+export async function regenerateTitle(id: string) {
+  const res = await authedFetch(`${API_BASE}/recordings/${id}/regenerate-title`, { method: "POST" });
+  if (!res.ok) throw new Error("Title regeneration failed");
+  return res.json();
+}
+
+export async function reprocessRecording(id: string) {
+  const res = await authedFetch(`${API_BASE}/recordings/${id}/reprocess`, { method: "POST" });
+  if (!res.ok) throw new Error("Reprocess failed");
   return res.json();
 }
 

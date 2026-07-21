@@ -5,6 +5,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
+import structlog
 from sqlalchemy import (
     DateTime,
     Enum,
@@ -18,6 +19,9 @@ from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def _now() -> datetime:
@@ -100,6 +104,10 @@ class Recording(Base):
         index=True,
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Short LLM-generated title (3-4 words) derived from the transcript after
+    # summarization. Kept separate from `title` so a name the user typed at
+    # upload is never overwritten; the web UI shows this when present.
+    generated_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)

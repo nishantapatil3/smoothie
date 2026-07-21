@@ -9,9 +9,10 @@ export default function AppLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
-  const view: "recordings" | "settings" = location.pathname.startsWith("/settings")
-    ? "settings"
-    : "recordings";
+  // Settings and Subscriptions are focused full-width pages that hide the left
+  // nav; everything else keeps the recordings sidebar.
+  const hideSidebar =
+    location.pathname.startsWith("/settings") || location.pathname.startsWith("/subscriptions");
 
   const loadUser = useCallback(async () => {
     try {
@@ -51,7 +52,9 @@ export default function AppLayout() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-4">
-              <h1 className="text-xl font-bold text-gray-900">🥤 Smoothie</h1>
+              <Link to="/" className="text-xl font-bold text-gray-900 hover:opacity-80">
+                🥤 Smoothie
+              </Link>
               <span className="text-xs text-gray-400 hidden sm:inline">v{VITE_WEBUI_VERSION}</span>
             </div>
 
@@ -88,6 +91,11 @@ export default function AppLayout() {
                   ⚙ Settings
                 </button>
               )}
+              {user.is_admin && (
+                <button onClick={() => navigate("/subscriptions")} className="w-full text-left p-2 rounded-lg hover:bg-gray-100">
+                  💳 Subscriptions
+                </button>
+              )}
             </nav>
           </div>
         )}
@@ -97,7 +105,7 @@ export default function AppLayout() {
         <aside
           className={cn(
             "w-64 bg-white border-r border-gray-200 flex-shrink-0 hidden md:block",
-            view === "settings" && "hidden"
+            hideSidebar && "hidden"
           )}
         >
           <nav className="p-4 space-y-1">
@@ -123,6 +131,19 @@ export default function AppLayout() {
                 )}
               >
                 ⚙ Settings
+              </Link>
+            )}
+            {user.is_admin && (
+              <Link
+                to="/subscriptions"
+                className={cn(
+                  "block px-3 py-2 rounded-lg text-sm font-medium transition-colors",
+                  location.pathname === "/subscriptions"
+                    ? "bg-primary-50 text-primary-700"
+                    : "text-gray-600 hover:bg-gray-50"
+                )}
+              >
+                💳 Subscriptions
               </Link>
             )}
           </nav>

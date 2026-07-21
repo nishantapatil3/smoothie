@@ -7,7 +7,6 @@ transcription.
 """
 from __future__ import annotations
 
-import logging
 import os
 import time
 from dataclasses import dataclass
@@ -24,8 +23,9 @@ from huggingface_hub.utils import RepositoryNotFoundError
 from .config import get_settings
 from .preprocess import collect_transcribe_options, run_audio_transforms
 from . import vad as _vad
+from .logging_config import get_logger
 
-logger = logging.getLogger("smoothie.transcription")
+logger = get_logger(__name__)
 
 
 class TranscriptionError(RuntimeError):

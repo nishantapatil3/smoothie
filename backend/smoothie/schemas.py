@@ -24,6 +24,10 @@ class RecordingListItem(BaseModel):
 
     id: str
     title: str | None
+    # Short LLM-generated title (3-4 words) derived after summarization. Shown
+    # in the UI in preference to `title` when present, so a user's own name is
+    # never overwritten.
+    generated_title: str | None = None
     status: JobStage
     language: str | None
     duration_sec: float | None

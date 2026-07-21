@@ -141,6 +141,7 @@ class Settings(BaseModel):
 def load_config() -> Settings:
     """Load settings from ``config.yaml``; fall back to defaults if absent."""
     if not CONFIG_PATH.exists():
+        logger.info("Config file not found at %s, using defaults", CONFIG_PATH)
         return Settings()
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -151,7 +152,9 @@ def load_config() -> Settings:
         # Drop keys the UI must not inject; pydantic extra="ignore" also covers
         # unknown keys defensively.
         data = {k: v for k, v in data.items() if k not in HIDDEN_SETTINGS}
-        return Settings(**data)
+        settings = Settings(**data)
+        logger.info("Loaded settings from %s", CONFIG_PATH)
+        return settings
     except Exception as exc:  # noqa: BLE001 - never let a bad file crash startup
         logger.warning("Failed to read config.yaml (%s); using defaults.", exc)
         return Settings()
@@ -163,6 +166,7 @@ def save_config(settings: Settings) -> None:
     payload = {k: v for k, v in payload.items() if k not in HIDDEN_SETTINGS}
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
+    logger.info("Saved settings to %s", CONFIG_PATH)
 
 
 @lru_cache
@@ -194,4 +198,5 @@ async def apply_settings(updates: dict[str, Any]) -> Settings:
         for key, value in updated.model_dump().items():
             setattr(settings, key, value)
         save_config(settings)
+        logger.info("Applied settings updates: %s", list(updates.keys()))
         return settings

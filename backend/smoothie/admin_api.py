@@ -17,8 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .auth import get_current_user
 from .config import get_settings
 from .db import get_session
+from .logging_config import get_logger
 from .models import User
 from .tiers import Tier, is_valid_tier
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -46,11 +49,29 @@ class TierUpdate(BaseModel):
 
 @router.get("/users", response_model=list[AdminUserOut])
 async def list_users(
+    q: str | None = None,
+    limit: int = 20,
     _: User = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> list[AdminUserOut]:
-    result = await session.execute(select(User).order_by(User.created_at))
-    return [AdminUserOut.model_validate(u) for u in result.scalars().all()]
+    """List users, optionally filtered by a username search term.
+
+    Pass ``q`` to match usernames case-insensitively (substring); results are
+    capped at ``limit`` so a search never streams the whole user table. Without
+    ``q`` the (capped) full list is returned for admin tooling.
+    """
+    stmt = select(User)
+    if q:
+        # Escape LIKE wildcards in the user input so a literal "%" or "_" in a
+        # search term isn't treated as a pattern.
+        like = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        stmt = stmt.where(User.username.ilike(f"%{like}%", escape="\\"))
+    stmt = stmt.order_by(User.username).limit(max(1, min(limit, 100)))
+    logger.info("Fetching users", query=q, limit=limit)
+    result = await session.execute(stmt)
+    users = [AdminUserOut.model_validate(u) for u in result.scalars().all()]
+    logger.info("Fetched %d users", len(users))
+    return users
 
 
 @router.put("/users/{user_id}/tier", response_model=AdminUserOut)
@@ -69,6 +90,8 @@ async def set_user_tier(
     target = await session.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found.")
+    logger.info("Updating user tier", user_id=user_id, new_tier=body.tier)
     target.tier = body.tier
     await session.commit()
+    logger.info("User tier updated", user_id=user_id, new_tier=body.tier)
     return AdminUserOut.model_validate(target)

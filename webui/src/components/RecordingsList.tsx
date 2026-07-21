@@ -55,6 +55,7 @@ export default function RecordingsList() {
                   ...p,
                   status: (event.stage ?? p.status) as RecordingListItem["status"],
                   progress: event.progress,
+                  generated_title: event.generated_title ?? p.generated_title,
                 }
               : p,
           ),
@@ -132,7 +133,7 @@ export default function RecordingsList() {
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1">
-                  <h3 className="font-medium text-gray-900 truncate">{r.title || "Untitled"}</h3>
+                  <h3 className="font-medium text-gray-900 truncate">{r.generated_title || r.title || "Untitled"}</h3>
                   <span
                     className={cn(
                       "badge",

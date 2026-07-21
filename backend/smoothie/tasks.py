@@ -253,16 +253,23 @@ async def _process_one() -> None:
 
             summarize_start = time.monotonic()
             provider = get_provider()
-            summary_text = await provider.summarize(summary_text_in)
+            result = await provider.summarize(summary_text_in)
             summarize_duration = time.monotonic() - summarize_start
 
             # Record summarization metrics
             summarization_duration_seconds.observe(summarize_duration)
 
             summary = recording.summary or Summary(recording_id=recording.id)
-            summary.markdown = summary_text
+            summary.markdown = result.summary
             summary.provider = provider.name
             session.add(summary)
+
+            # Store the LLM-generated short title (3-4 words). Kept on its own
+            # column so it never clobbers a name the user typed at upload; the
+            # web UI shows it when present. Empty/None titles are skipped so a
+            # coherent default (the filename) remains visible.
+            if result.title:
+                recording.generated_title = result.title[:255]
 
             job.stage = JobStage.COMPLETED
             recording.status = JobStage.COMPLETED
@@ -408,3 +415,36 @@ async def retry_summary(recording_id: str) -> bool:
         recording.status = JobStage.SUMMARIZING
         await session.commit()
         return True
+
+
+async def regenerate_title(recording_id: str) -> str | None:
+    """Generate a short title from a recording's existing summary.
+
+    Unlike :func:`retry_summary`, this does not re-transcribe or re-summarize —
+    it only asks the LLM for a 3-4 word title based on the summary already
+    stored. Returns the new title, or ``None`` when there is no summary to draw
+    from yet (the caller can fall back to a full reprocess).
+    """
+    async with async_session() as session:
+        recording = (
+            await session.execute(
+                select(Recording)
+                .where(Recording.id == recording_id)
+                .options(selectinload(Recording.summary))
+            )
+        ).scalar_one_or_none()
+        if recording is None or recording.summary is None or not recording.summary.markdown:
+            return None
+
+        provider = get_provider()
+        try:
+            title = await provider.generate_title(recording.summary.markdown)
+        except SummaryError as exc:
+            logger.error("Title generation failed for %s: %s", recording_id, exc)
+            return None
+
+        # Keep an empty result from clobbering an existing good title.
+        if title:
+            recording.generated_title = title[:255]
+            await session.commit()
+        return title or None
