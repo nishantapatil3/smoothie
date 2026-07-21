@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getRecording, deleteRecording, retrySummary, onRecordingEvents } from "../api";
+import { getRecording, deleteRecording, retrySummary, regenerateTitle, reprocessRecording, onRecordingEvents } from "../api";
 import type { RecordingDetail, SSEEvent, Segment } from "../types/api";
 
 const STAGES = ["pending", "transcribing", "summarizing", "completed"] as const;
@@ -15,6 +15,10 @@ function TranscriptView() {
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState("");
+  const [retitling, setRetitling] = useState(false);
+  const [retitleError, setRetitleError] = useState("");
+  const [rerunning, setRerunning] = useState(false);
+  const [rerunError, setRerunError] = useState("");
   const sseCleanupRef = useRef<(() => void) | null>(null);
 
   const loadRecording = useCallback(async () => {
@@ -73,6 +77,7 @@ function TranscriptView() {
               status: (event.stage ?? prev.status) as typeof prev.status,
               progress: event.progress,
               error: event.error,
+              generated_title: event.generated_title ?? prev.generated_title,
             }
           : null,
       );
@@ -102,6 +107,29 @@ function TranscriptView() {
   if (!recording) return <div className="detail">Not found.</div>;
   const rec = recording;
 
+  // Determine the workflow steps
+  let workflowSteps = ["pending", "transcribing", "summarizing"];
+  if (rec.summary) {
+    workflowSteps = [...workflowSteps, "regenerate title", "completed"];
+  } else {
+    workflowSteps = [...workflowSteps, "completed"];
+  }
+
+  // Determine the current index in the workflowSteps array
+  let currentIndex;
+  if (rec.status === "completed") {
+    currentIndex = workflowSteps.length - 1;
+  } else {
+    const statusIndexMap = {
+      pending: 0,
+      transcribing: 1,
+      summarizing: 2
+    };
+    currentIndex = statusIndexMap[rec.status];
+  }
+
+  return (
+
   async function handleDelete() {
     if (!confirm(`Delete "${rec.title || "this recording"}"?`)) return;
     await deleteRecording(rec.id);
@@ -120,98 +148,133 @@ function TranscriptView() {
     }
   }
 
+  async function handleRegenerateTitle() {
+    setRetitling(true);
+    setRetitleError("");
+    try {
+      const data = await regenerateTitle(rec.id);
+      setRecording((prev) => (prev ? { ...prev, generated_title: data.generated_title } : prev));
+    } catch (err: unknown) {
+      setRetitleError(err instanceof Error ? err.message : "Title regeneration failed");
+      // Refresh so a 409 (no summary) surfaces the real state.
+      loadRecording();
+    } finally {
+      setRetitling(false);
+    }
+  }
+
+  async function handleReprocess() {
+    setRerunning(true);
+    setRerunError("");
+    try {
+      await reprocessRecording(rec.id);
+      // Optimistic UI: move to pending immediately.
+      setRecording((prev) => (prev ? { ...prev, status: "pending", progress: 0.0, error: null } : prev));
+    } catch (err: unknown) {
+      setRerunError(err instanceof Error ? err.message : "Reprocess failed");
+      // Refresh so a 404/409 surfaces the real state.
+      loadRecording();
+    } finally {
+      setRerunning(false);
+    }
+  }
+
   return (
     <div className="detail">
       <div className="detail-head">
-        <h2>{recording.title || "Untitled"}</h2>
+        <h2>{recording.generated_title || recording.title || "Untitled"}</h2>
         <button className="btn btn-ghost btn-small" onClick={handleDelete}>
           🗑 Delete
         </button>
       </div>
 
-      {recording.status === "failed" && (
-        <div className="error box">
-          <div>Failed: {recording.error}</div>
-          {recording.full_text ? (
-            <button
-              className="btn btn-primary btn-small mt-2"
-              onClick={handleRetrySummary}
-              disabled={retrying}
-            >
-              {retrying ? "Retrying…" : "↻ Retry summary"}
-            </button>
-          ) : (
-            <div className="muted small mt-2">
-              Transcript not ready — re-run the full job to retry.
-            </div>
-          )}
-          {retryError && <div className="muted small mt-2">{retryError}</div>}
-        </div>
-      )}
-
-      {recording.status === "cancelled" && (
-        <div className="error box">
-          <div>Job was cancelled: {recording.error}</div>
-          <button className="btn btn-primary btn-small mt-2" onClick={() => window.location.reload()}>
-            ↻ Reload to re-process
-          </button>
-        </div>
-      )}
-
-      {["pending", "transcribing", "summarizing", "completed"].includes(recording.status) && (
-        <div className="workflow box">
-          {(["pending", "transcribing", "summarizing", "completed"] as const).map((stage) => {
-            const idx = STAGES.indexOf(stage);
-            const currentIdx = STAGES.indexOf(recording.status as (typeof STAGES)[number]);
-            const isCompleted = recording.status === "completed";
-            // The final "completed" node becomes a green checkmark once the
-            // whole pipeline finishes, rather than lingering as the active step.
-            const done = idx < currentIdx || (stage === "completed" && isCompleted);
-            const active = idx === currentIdx && !isCompleted;
-            return (
-              <div key={stage} className="flex items-center">
-                <span
-                  className={cn(
-                    "workflow-dot",
-                    done && "done",
-                    active && "active",
-                  )}
-                >
-                  {done ? "✓" : idx + 1}
-                </span>
-                <span
-                  className={cn(
-                    "workflow-label",
-                    done && "text-green-700",
-                    active && "text-gray-900 font-medium",
-                    !done && !active && "text-gray-400",
-                  )}
-                >
-                  {stage === "transcribing"
-                    ? `Transcribing ${Math.round((recording.progress || 0) * 100)}%`
-                    : stage.charAt(0).toUpperCase() + stage.slice(1)}
-                </span>
-                {stage !== "completed" && (
-                  <span className={cn("workflow-line", done && "done")} />
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
       {recording.summary && (
         <section className="card mt-4">
           <div className="box">
-            <h3 className="text-lg font-semibold mb-2">Summary</h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-lg font-semibold">Summary</h3>
+              <button
+                className="btn btn-secondary btn-small"
+                onClick={handleRegenerateTitle}
+                disabled={retitling}
+                title="Regenerate the short title from this summary"
+              >
+                {retitling ? "Regenerating…" : "↻ Regenerate title"}
+              </button>
+            </div>
             <div className="markdown">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{recording.summary}</ReactMarkdown>
             </div>
             {recording.summary_provider && (
               <div className="muted small mt-2">via {recording.summary_provider}</div>
             )}
+            {retitleError && <div className="muted small mt-2 text-red-600">{retitleError}</div>}
           </div>
         </section>
+      )}
+
+      {["pending", "transcribing", "summarizing", "completed"].includes(recording.status) && (
+        <div className="workflow box">
+          {workflowSteps.map((step, index) => {
+            const isCompleted = recording.status === "completed";
+            const done = index < currentIndex || (step === "completed" && isCompleted);
+            const active = index === currentIndex && !isCompleted;
+            return (
+              <div key={step} className="flex items-center justify-between w-full">
+                <div className="flex items-center gap-4">
+                  <span
+                    className={cn(
+                      "workflow-dot",
+                      done && "done",
+                      active && "active",
+                    )}
+                  >
+                    {done ? "✓" : index + 1}
+                  </span>
+                  <span
+                    className={cn(
+                      "workflow-label",
+                      done && "text-green-700",
+                      active && "text-gray-900 font-medium",
+                      !done && !active && "text-gray-400",
+                    )}
+                  >
+                    {step === "transcribing"
+                      ? `Transcribing ${Math.round((recording.progress || 0) * 100)}%`
+                      : step.charAt(0).toUpperCase() + step.slice(1)}
+                  </span>
+                  {step !== "completed" && (
+                    <span className={cn("workflow-line", done && "done")} />
+                  )}
+                </div>
+                <button
+                  className="btn btn-ghost"
+                  onClick={async () => {
+                    setRerunning(true);
+                    setRerunError("");
+                    try {
+                      if (step === "pending" || step === "transcribing" || step === "completed") {
+                        await reprocessRecording(rec.id); // full rerun
+                      } else if (step === "summarizing") {
+                        await retrySummary(rec.id); // resume summarization
+                      } else if (step === "regenerate title") {
+                        await regenerateTitle(rec.id); // regenerate title
+                      }
+                    } catch (err: unknown) {
+                      setRerunError(err instanceof Error ? err.message : "Rerun failed");
+                    } finally {
+                      setRerunning(false);
+                    }
+                  }}
+                  disabled={rerunning}
+                  title={`Rerun from ${step}`}
+                >
+                  {rerunning ? "Rerunning…" : `Re-run ${step}`}
+                </button>
+              </div>
+            );
+          })}
+        </div>
       )}
 
       <section className="mt-4">
