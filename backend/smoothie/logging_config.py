@@ -65,7 +65,7 @@ def configure_logging(json_logs: bool = False, log_level: str = "INFO") -> None:
         ]
     else:
         processors = shared_processors + [
-            structlog.dev.ConsoleRenderer(colors=True),
+            structlog.dev.ConsoleRenderer(colors=True, pad_level=False),
         ]
 
     structlog.configure(
