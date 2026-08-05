@@ -1,8 +1,23 @@
 """FastAPI application: recording upload, status, and static UI serving."""
 from __future__ import annotations
 
+import os
 import uuid
+import sys
 from pathlib import Path
+
+# Support both `uvicorn smoothie.main:app` and `python smoothie/main.py`.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "smoothie"
+
+# Use the macOS Keychain certificates, including enterprise proxy CAs, instead
+# of Python's bundled CA list. This must run before importing Hugging Face/httpx.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+import truststore
+
+truststore.inject_into_ssl()
 
 import structlog
 from fastapi import FastAPI, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -465,3 +480,9 @@ if UI_DIST.exists():
         if full_path and requested.exists() and requested.is_file():
             return FileResponse(str(requested))
         return FileResponse(str(index))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host=settings.host, port=settings.port)

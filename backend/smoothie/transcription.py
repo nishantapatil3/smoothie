@@ -57,7 +57,7 @@ def _model_id() -> str:
 
 
 def _load_model_safe(model_id: str) -> None:
-    """Load ``model_id`` into MLX memory, raising a clear error on failure.
+    """Download and load ``model_id`` into MLX memory.
 
     A missing/non-existent Hugging Face repo raises a confusing
     ``401 Client Error`` / "Invalid username and password" from the hub client;
@@ -65,7 +65,12 @@ def _load_model_safe(model_id: str) -> None:
     surfaces clearly to the user instead of looking like an auth problem.
     """
     try:
-        _load_models.load_model(model_id, dtype=mx.float16)
+        # Download explicitly first. Passing the resolved local cache path to
+        # MLX Whisper avoids relying on its implicit download behavior.
+        model_path = _download_model(model_id)
+        _load_models.load_model(model_path, dtype=mx.float16)
+    except TranscriptionError:
+        raise
     except (RepositoryNotFoundError, HFValidationError) as exc:
         raise TranscriptionError(
             f"Transcription model '{model_id}' was not found. Check the model "
@@ -74,6 +79,26 @@ def _load_model_safe(model_id: str) -> None:
         ) from exc
     except Exception as exc:  # noqa: BLE001 - wrap anything else as a transcription failure
         raise TranscriptionError(f"Failed to load transcription model '{model_id}': {exc}") from exc
+
+
+def _download_model(model_id: str) -> str:
+    """Return a local model path, downloading a Hugging Face model if needed."""
+    if Path(model_id).expanduser().exists():
+        return str(Path(model_id).expanduser())
+
+    try:
+        logger.info("Ensuring Whisper model '%s' is downloaded.", model_id)
+        return snapshot_download(repo_id=model_id)
+    except (RepositoryNotFoundError, HFValidationError) as exc:
+        raise TranscriptionError(
+            f"Transcription model '{model_id}' was not found. Check the model "
+            "id in Settings — MLX Whisper models use the '-mlx' suffix "
+            "(e.g. mlx-community/whisper-small-mlx)."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - wrap download failures consistently
+        raise TranscriptionError(
+            f"Failed to download transcription model '{model_id}': {exc}"
+        ) from exc
 
 
 # The model id that was successfully warmed into MLX memory at startup. Used by
