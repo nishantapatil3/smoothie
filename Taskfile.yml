@@ -1,0 +1,63 @@
+version: '3'
+
+vars:
+  PYTHON: '{{.PYTHON | default "python3.12"}}'
+  HOST: '{{.HOST | default "127.0.0.1"}}'
+  PORT: '{{.PORT | default "5173"}}'
+
+tasks:
+  default:
+    desc: Show available commands
+    silent: true
+    cmds:
+      - task --list-all
+
+  backend:
+    desc: Start the backend (installs dependencies on first run)
+    dir: '{{.ROOT_DIR}}/backend'
+    preconditions:
+      - sh: command -v ffmpeg >/dev/null 2>&1
+        msg: 'FFmpeg is required. On macOS, install it with: brew install ffmpeg'
+    cmds:
+      - task: backend:setup
+      - .venv/bin/python -m uvicorn smoothie.main:app --reload --host '{{.HOST}}' --port '{{.PORT}}'
+
+  backend:setup:
+    desc: Create the backend virtual environment and install dependencies
+    dir: '{{.ROOT_DIR}}/backend'
+    method: timestamp
+    sources:
+      - pyproject.toml
+      - ../Taskfile.yml
+    generates:
+      - .venv/.installed
+    preconditions:
+      - sh: command -v '{{.PYTHON}}' >/dev/null 2>&1
+        msg: 'Python is required. Install Python 3.12 or pass PYTHON=python3 (3.10+).'
+    cmds:
+      - test -x .venv/bin/python || '{{.PYTHON}}' -m venv .venv
+      - .venv/bin/python -m pip install -e .
+      - touch .venv/.installed
+
+  webui:
+    desc: Start the web UI (installs dependencies on first run)
+    dir: '{{.ROOT_DIR}}/webui'
+    cmds:
+      - task: webui:setup
+      - npm run dev
+
+  webui:setup:
+    desc: Install web UI dependencies
+    dir: '{{.ROOT_DIR}}/webui'
+    method: timestamp
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules/.installed
+    preconditions:
+      - sh: command -v npm >/dev/null 2>&1
+        msg: 'Node.js and npm are required. Install Node.js 18 or newer.'
+    cmds:
+      - npm ci
+      - touch node_modules/.installed

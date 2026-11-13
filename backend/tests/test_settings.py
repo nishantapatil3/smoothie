@@ -79,3 +79,31 @@ def test_removed_account_settings_are_ignored(client):
     assert res.json()["summary_model"] == "local-model"
     assert not any(key.startswith("auth_") or key == "admin_usernames" for key in res.json())
     assert "admin_usernames" not in config_mod.CONFIG_PATH.read_text()
+
+def test_folder_paths_update_and_persist(client, tmp_path):
+    watch = tmp_path / "incoming"
+    output = tmp_path / "results"
+    res = client.put("/api/settings", json={
+        "watch_dir": str(watch), "output_dir": str(output),
+    })
+    assert res.status_code == 200
+    assert res.json()["watch_dir"] == str(watch)
+    assert res.json()["output_dir"] == str(output)
+    assert client.get("/api/settings").json()["watch_dir"] == str(watch)
+    config_mod.get_settings.cache_clear()
+    assert config_mod.get_settings().watch_dir == watch
+    assert config_mod.get_settings().output_dir == output
+
+
+def test_invalid_folder_paths_leave_settings_unchanged(client, tmp_path):
+    before = client.get("/api/settings").json()
+    file = tmp_path / "file.txt"
+    file.write_text("not a directory")
+    for update in [
+        {"watch_dir": ""}, {"output_dir": "   "},
+        {"watch_dir": None}, {"output_dir": str(file)},
+        {"watch_dir": before["output_dir"]},
+        {"watch_dir": before["output_dir"] + "/nested"},
+    ]:
+        assert client.put("/api/settings", json=update).status_code == 422
+        assert client.get("/api/settings").json() == before

@@ -71,6 +71,8 @@ export interface Settings {
   summary_model: string;
   summary_provider: "api" | "codex";
   job_poll_interval: number;
+  watch_dir: string;
+  output_dir: string;
   watch_enabled: boolean;
   watch_poll_interval: number;
   watch_stable_seconds: number;

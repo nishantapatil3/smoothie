@@ -7,6 +7,7 @@ are never returned or accepted. Settings are shared by this deployment.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -42,6 +43,8 @@ class SettingsOut(BaseModel):
     summary_codex_model: str
     summary_codex_timeout: float
     job_poll_interval: float
+    watch_dir: Path
+    output_dir: Path
     watch_enabled: bool
     watch_poll_interval: float
     watch_stable_seconds: float
@@ -79,6 +82,8 @@ class SettingsUpdate(BaseModel):
     summary_codex_model: str | None = None
     summary_codex_timeout: float | None = Field(default=None, gt=0)
     job_poll_interval: float | None = None
+    watch_dir: str | None = Field(default=None, min_length=1)
+    output_dir: str | None = Field(default=None, min_length=1)
     watch_enabled: bool | None = None
     watch_poll_interval: float | None = Field(default=None, ge=0.1)
     watch_stable_seconds: float | None = Field(default=None, ge=0)

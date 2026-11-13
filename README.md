@@ -40,6 +40,26 @@ Upload → enqueue async job → transcribe → summarize → persisted. The cli
 
 ### 1. Backend
 
+With [Task](https://taskfile.dev/) installed (`brew install go-task` on macOS),
+run from the repository root:
+
+```bash
+task backend
+```
+
+Run `task` to show the available commands.
+
+`task backend` creates `backend/.venv`, installs backend dependencies on first run (and
+when `pyproject.toml` changes), and starts the backend with auto-reload at
+`http://127.0.0.1:5173`. Python 3.12 and FFmpeg must already be installed.
+Stop with `Ctrl+C`. No virtual environment activation is needed.
+
+You can install dependencies with `task backend:setup`
+or override defaults, for example `task backend PYTHON=python3 PORT=8000`.
+Use `task --force backend:setup` to reinstall dependencies if needed.
+
+To set up and run manually:
+
 ```bash
 cd backend
 python3.12 -m venv .venv
@@ -96,6 +116,17 @@ are downloaded again in whisper.cpp format. Local MLX directories must be
 replaced with a whisper.cpp `.bin` file.
 
 ### 2. Web UI (dev mode)
+
+From the repository root, run this in a second terminal alongside `task backend`:
+
+```bash
+task webui
+```
+
+This installs dependencies when needed and starts Vite at `http://localhost:5174`.
+Use `task webui:setup` to install dependencies only.
+
+Or run manually:
 
 ```bash
 cd webui
@@ -212,6 +243,12 @@ committed.
 
 The web UI has a **Settings** page (⚙ in the header) that reads and edits every
 setting live — changes apply immediately and are written back to `config.yaml`.
+Under **Folder imports**, edit the watch and output folder paths, then save.
+Paths are on the backend machine; relative paths resolve from the repository
+root and `~` expands to the backend user's home directory. Changes apply to new
+recordings without moving existing files. The watch folder must be outside
+the output folder.
+
 `data_dir` and `ffmpeg_bin` are **not** exposed in the UI
 (local paths / database stability); set those directly in `config.yaml`.
 

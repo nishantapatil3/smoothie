@@ -32,7 +32,7 @@ DATA_DIR = BACKEND_ROOT / "data"
 CONFIG_PATH = BACKEND_ROOT / "config.yaml"
 
 # Settings the web UI is not allowed to read or write (secret / DB-stability).
-HIDDEN_SETTINGS = {"data_dir", "ffmpeg_bin", "watch_dir", "output_dir", "codex_bin", "codex_home"}
+HIDDEN_SETTINGS = {"data_dir", "ffmpeg_bin", "codex_bin", "codex_home"}
 
 
 class Settings(BaseModel):
@@ -63,8 +63,15 @@ class Settings(BaseModel):
     @field_validator("watch_dir", "output_dir", mode="before")
     @classmethod
     def resolve_folder(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Folder path must not be empty")
         path = Path(value).expanduser()
-        return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+        path = (path if path.is_absolute() else REPO_ROOT / path).resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError("Folder path must refer to a directory")
+        return path
 
     @model_validator(mode="after")
     def check_folders(self):

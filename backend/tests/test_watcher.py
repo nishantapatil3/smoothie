@@ -285,9 +285,9 @@ def test_local_paths_survive_config_save(client):
     assert reloaded.watch_dir == watch
     assert reloaded.output_dir == output
     response = client.put("/api/settings", json={"watch_dir": "/evil", "output_dir": "/evil"})
-    assert response.status_code == 200
-    assert "watch_dir" not in response.json()
+    assert response.status_code == 422
     assert settings.watch_dir == watch
+    assert settings.output_dir == output
 
 
 def test_restart_resumes_saved_transcript_at_summary_stage(client, tmp_path, monkeypatch):

@@ -5,15 +5,17 @@ import { cn } from "../lib/utils";
 
 export default function Settings() {
   const [settings, setSettings] = useState<SettingsDto | null>(null);
+  const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const loadSettings = async () => {
+    setLoadError("");
     try {
       const data = await getSettings();
       setSettings(data);
-    } catch (err) {
-      console.error(err);
+    } catch {
+      setLoadError("Unable to load settings. Check that the Smoothie backend is running and connected, then try again.");
     }
   };
 
@@ -38,7 +40,8 @@ export default function Settings() {
           updates[k] = val;
         }
       });
-      await saveSettings(updates as SettingsUpdate);
+      const saved = await saveSettings(updates as SettingsUpdate);
+      setSettings(saved);
       setMessage({ type: "success", text: "Settings saved" });
     } catch (err) {
       setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to save" });
@@ -47,7 +50,17 @@ export default function Settings() {
     }
   };
 
-  if (!settings) return <div className="p-4">Loading settings…</div>;
+  if (!settings) return (
+    <div className="max-w-3xl mx-auto">
+      <h1 className="text-2xl font-bold text-gray-900 mb-6">Settings</h1>
+      {loadError ? (
+        <div role="alert" className="error p-3 bg-red-50 border border-red-200 rounded-lg flex items-center justify-between gap-3">
+          <span>{loadError}</span>
+          <button className="btn btn-secondary btn-small shrink-0" onClick={loadSettings}>Try again</button>
+        </div>
+      ) : <p role="status" className="text-gray-500">Loading settings…</p>}
+    </div>
+  );
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -147,7 +160,20 @@ export default function Settings() {
                 className="h-4 w-4 rounded border-gray-300" />
               Automatically import audio from the watch folder
             </label>
-            <p className="hint">Originals stay in the watch folder. Smoothie saves audio copies, transcripts, and summaries in the output folder. Folder paths are configured in config.yaml.</p>
+            <p className="hint">Originals stay in the watch folder. Smoothie saves audio copies, transcripts, and summaries in the output folder. Path changes apply to new recordings; existing files stay in their current location.</p>
+            <div>
+              <label htmlFor="watch-dir" className="label">Watch folder path</label>
+              <input id="watch-dir" type="text" required className="input" spellCheck={false}
+                value={settings.watch_dir} onChange={(e) => handleChange("watch_dir", e.target.value)}
+                aria-describedby="folder-path-hint" />
+            </div>
+            <div>
+              <label htmlFor="output-dir" className="label">Output folder path</label>
+              <input id="output-dir" type="text" required className="input" spellCheck={false}
+                value={settings.output_dir} onChange={(e) => handleChange("output_dir", e.target.value)}
+                aria-describedby="folder-path-hint" />
+            </div>
+            <p id="folder-path-hint" className="hint">Paths refer to folders on the backend machine. Use an absolute path, ~/ for your home folder, or a path relative to the Smoothie repository. The watch folder must be outside the output folder.</p>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="label">Scan interval (seconds)</label>

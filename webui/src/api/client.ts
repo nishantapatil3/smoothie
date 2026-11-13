@@ -28,9 +28,15 @@ export async function saveSettings(updates: Record<string, unknown>) {
 
 // Recordings
 export async function listRecordings() {
-  const res = await fetch(`${API_BASE}/recordings`);
-  if (!res.ok) throw new Error("Failed to list recordings");
-  return res.json();
+  try {
+    const res = await fetch(`${API_BASE}/recordings`);
+    if (!res.ok) throw new Error("Recordings request failed");
+    return await res.json();
+  } catch {
+    throw new Error(
+      "Unable to load recordings. Check that the Smoothie backend is running and connected, then try again.",
+    );
+  }
 }
 
 export async function getRecording(id: string) {
