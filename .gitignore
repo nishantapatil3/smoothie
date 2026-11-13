@@ -30,15 +30,6 @@ webui/dist/
 webui/.env.local
 webui/.env.*.local
 
-# Native macOS build artifacts
-macapp/.build/
-macapp/.swiftpm/
-xcuserdata/
-dist/
-*.app/
-*.dmg
-*.zip
-
 # Logs
 *.log
 

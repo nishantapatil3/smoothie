@@ -93,39 +93,6 @@ uvicorn smoothie.main:app --port 5173
 # open http://localhost:5173
 ```
 
-### macOS menu bar app
-
-The repository includes a native Apple Silicon menu bar app. It starts the
-bundled Python backend as a child daemon, stores runtime data under
-`~/Library/Application Support/Smoothie`, and provides quick actions for:
-
-- Sign in or register
-- Record from the microphone and upload
-- Upload an audio file
-- View recent recording/job status
-- Open the full web dashboard
-
-Build the app and disk image on an Apple Silicon Mac:
-
-```bash
-./scripts/build-mac-app.sh
-open dist/Smoothie.app
-```
-
-To install manually, copy `dist/Smoothie.app` to `/Applications`. The first
-launch may download the Whisper model and will request microphone permission.
-The app is currently Apple Silicon only because the backend uses MLX Whisper.
-
-After publishing the generated DMG to a GitHub release, install it through the
-Homebrew cask definition:
-
-```bash
-brew install --cask https://raw.githubusercontent.com/nishantapatil3/smoothie/main/packaging/homebrew/smoothie.rb
-```
-
-The cask URL expects a matching `v0.0.3` GitHub release asset named
-`Smoothie-0.0.3.dmg`.
-
 ## Development & tests
 
 Install the backend with the `dev` extra (adds `pytest`), then run the test suite:
