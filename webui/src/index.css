@@ -1082,3 +1082,7 @@ body {
     font-size: 13px;
   }
 }
+
+.status-dot.connection-connected { background: #4fc296; }
+.status-dot.connection-disconnected { background: #f87171; }
+.status-dot.connection-checking { background: #9aa5b5; }

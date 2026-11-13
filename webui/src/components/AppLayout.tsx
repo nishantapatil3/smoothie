@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { getHealth } from "../api";
 import { Outlet, Link, useLocation } from "react-router-dom";
 import { VITE_WEBUI_VERSION } from "../api/config";
 import { cn } from "../lib/utils";
@@ -6,6 +8,15 @@ import Icon from "./Icon";
 
 export default function AppLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const health = useQuery({
+    queryKey: ["backend-health"],
+    queryFn: () => getHealth(AbortSignal.timeout(4000)),
+    refetchInterval: 10000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+  const connection = health.isPending ? "checking" : health.isError || health.data?.status !== "ok" ? "disconnected" : "connected";
+  const connectionLabel = connection === "checking" ? "Checking backend…" : connection === "connected" ? "Backend connected" : "Backend disconnected";
   const location = useLocation();
   const isSettings = location.pathname.startsWith("/settings");
   return (
@@ -53,7 +64,7 @@ export default function AppLayout() {
             </p>
           </div>
           <div className="sidebar-version">
-            <span className="status-dot" /> Local-first audio{" "}
+            <Icon name="audio" size={13} /> Local-first audio{" "}
             <span>v{VITE_WEBUI_VERSION}</span>
           </div>
         </div>
@@ -71,8 +82,8 @@ export default function AppLayout() {
             </button>
             <span>{isSettings ? "Settings" : "Recordings"}</span>
           </div>
-          <span className="local-label">
-            <span className="status-dot" /> On-device transcription
+          <span className="local-label" role="status" aria-live="polite" title="Backend health is checked every 10 seconds.">
+            <span className={`status-dot connection-${connection}`} aria-hidden="true" /> {connectionLabel}
           </span>
         </header>
         <main id="main-content" className="main-content">

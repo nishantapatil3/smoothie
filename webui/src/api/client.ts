@@ -3,8 +3,8 @@ import type { SSEEvent } from "../types/api";
 
 const API_BASE = VITE_API_BASE_URL || "/api";
 
-export async function getHealth() {
-  const res = await fetch(`${API_BASE}/health`);
+export async function getHealth(signal?: AbortSignal) {
+  const res = await fetch(`${API_BASE}/health`, { signal, cache: "no-store" });
   if (!res.ok) throw new Error("Health check failed");
   return res.json();
 }
