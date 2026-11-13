@@ -75,7 +75,7 @@ async def start_worker() -> None:
     # TRANSCRIBING/SUMMARIZING at startup belongs to a dead process and is safe
     # to restart.
     await _recover_orphans()
-    # Warm the Whisper model into MLX memory at startup. Run off the event loop
+    # Warm the Whisper model into whisper.cpp memory at startup. Run off the event loop
     # (blocking load) but await it so its log lines appear in order at startup.
     # Non-fatal: failures are logged and retried on first use.
     await asyncio.to_thread(warm_model)
@@ -188,7 +188,7 @@ async def _process_one() -> None:
 
                 path = str(_audio_path_for(recording.filename))
                 transcribe_start = time.monotonic()
-                # mlx_whisper.transcribe is blocking; run it off the event loop
+                # whisper.cpp transcription is blocking; run it off the event loop
                 # via asyncio.to_thread. Its progress callback is invoked from
                 # that worker thread, so it must be a *synchronous* function.
                 # We bridge the async DB write back onto the event loop with

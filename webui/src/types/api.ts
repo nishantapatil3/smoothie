@@ -10,18 +10,6 @@ export interface User {
   is_admin: boolean;
 }
 
-export interface Recording {
-  id: string;
-  user_id: string;
-  title: string | null;
-  filename: string;
-  content_type: string | null;
-  language: string | null;
-  duration_sec: number | null;
-  created_at: string;
-  status: JobStage;
-}
-
 export type JobStage = "pending" | "transcribing" | "summarizing" | "completed" | "failed" | "cancelled";
 
 export interface RecordingListItem {
@@ -75,6 +63,8 @@ export interface Settings {
   host: string;
   port: number;
   transcription_model: string;
+  transcription_device: "auto" | "cpu";
+  transcription_gpu_device: number;
   transcription_language: string | null;
   vad_enabled: boolean;
   vad_threshold: number;
@@ -98,7 +88,6 @@ export interface Settings {
   tune_beam_size: number | null;
   tune_condition_on_previous_text: boolean | null;
   tune_no_speech_threshold: number | null;
-  tune_hallucination_silence_threshold: number | null;
 }
 
 export type SettingsUpdate = Partial<Settings>;

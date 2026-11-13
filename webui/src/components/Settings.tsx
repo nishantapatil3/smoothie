@@ -76,11 +76,27 @@ export default function Settings({ onTierChanged }: { onTierChanged: () => void 
                 onChange={(e) => handleChange("transcription_model", e.target.value)}
                 className="input"
               >
-                <option value="mlx-community/whisper-tiny-mlx">Whisper Tiny (fastest)</option>
-                <option value="mlx-community/whisper-base-mlx">Whisper Base</option>
-                <option value="mlx-community/whisper-small-mlx">Whisper Small</option>
-                <option value="mlx-community/whisper-medium-mlx">Whisper Medium</option>
-                <option value="mlx-community/whisper-large-v3-mlx">Whisper Large v3 (best)</option>
+                <option value="tiny">Whisper Tiny (fastest)</option>
+                <option value="base">Whisper Base</option>
+                <option value="small">Whisper Small</option>
+                <option value="medium">Whisper Medium</option>
+                {!["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"].includes(settings.transcription_model) && (
+                  <option value={settings.transcription_model}>{settings.transcription_model}</option>
+                )}
+                <option value="large-v3-turbo">Whisper Large v3 Turbo</option>
+                <option value="large-v3">Whisper Large v3 (best)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="label">Processing device</label>
+              <select
+                value={settings.transcription_device}
+                onChange={(e) => handleChange("transcription_device", e.target.value)}
+                className="input"
+              >
+                <option value="auto">Automatic (GPU when available)</option>
+                <option value="cpu">CPU</option>
               </select>
             </div>
 

@@ -1,22 +1,22 @@
-"""MLX Whisper transcription wrapper.
+"""Local whisper.cpp transcription with a cached, serialized model context.
 
-The model is loaded once into MLX memory (warmed at backend startup via
-``warm_model``) and reused across requests through MLX Whisper's internal model
-cache. On Apple Silicon this runs on the GPU via MLX for fast local
-transcription.
+GPU discovery and CPU fallback are handled by whisper.cpp using the backends
+compiled into pywhispercpp. Decode calls share native state, so warming,
+reloading, and transcription all run under the same lock.
 """
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
-import mlx.core as mx
-import mlx_whisper
-import mlx_whisper.load_models as _load_models
 import numpy as np
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import HFValidationError
 from huggingface_hub.utils import RepositoryNotFoundError
 
@@ -36,133 +36,140 @@ class TranscriptionError(RuntimeError):
 class TranscriptionResult:
     text: str
     segments: list[dict]  # [{start, end, text}, ...]
-    # Final transcription progress (0.0-1.0) captured just before the live
-    # progress counter is reset.
+    # Completed transcription progress (0.0-1.0).
     progress: float = 0.0
 
 
-# Whisper is far more reliable on bounded audio windows than on a single very
-# long clip. Passing a whole multi-minute recording to ``mlx_whisper.transcribe``
-# in one call causes the large-v3 model to stop decoding partway through
-# (empirically ~100s in), silently truncating the transcript. Slicing long audio
-# into fixed windows and transcribing each independently avoids that and matches
-# how Whisper is intended to handle long input.
+# Keep bounded windows for predictable progress and long-recording coverage.
 _CHUNK_SECONDS = 30
 _CHUNK_OVERLAP_SECONDS = 1
+_MODEL_REPO = "ggerganov/whisper.cpp"
+_model_lock = RLock()
+_model = None
+_model_key: tuple | None = None
+
+
+@atexit.register
+def release_model() -> None:
+    """Free native weights before Python tears down the binding module."""
+    global _model, _model_key
+    with _model_lock:
+        _model = None
+        _model_key = None
 
 
 def _model_id() -> str:
-    """Return the configured model id/path."""
     return get_settings().transcription_model
 
 
-def _load_model_safe(model_id: str) -> None:
-    """Download and load ``model_id`` into MLX memory.
+def _download_model(model_id: str) -> str:
+    """Resolve a named ggml model or an existing local .bin file."""
+    local = Path(model_id).expanduser()
+    if local.is_file():
+        return str(local.resolve())
+    if local.exists():
+        raise TranscriptionError("Choose a whisper.cpp .bin model file, not a directory.")
 
-    A missing/non-existent Hugging Face repo raises a confusing
-    ``401 Client Error`` / "Invalid username and password" from the hub client;
-    we translate that into a readable :class:`TranscriptionError` so the failure
-    surfaces clearly to the user instead of looking like an auth problem.
-    """
+    from pywhispercpp.constants import AVAILABLE_MODELS
+
+    if model_id not in AVAILABLE_MODELS:
+        raise TranscriptionError(
+            f"Unknown whisper.cpp model '{model_id}'. Choose a model name such as "
+            "tiny, small, large-v3, or a local ggml .bin file. MLX weights are not compatible."
+        )
     try:
-        # Download explicitly first. Passing the resolved local cache path to
-        # MLX Whisper avoids relying on its implicit download behavior.
+        return hf_hub_download(repo_id=_MODEL_REPO, filename=f"ggml-{model_id}.bin")
+    except (RepositoryNotFoundError, HFValidationError) as exc:
+        raise TranscriptionError(f"Whisper model '{model_id}' was not found.") from exc
+    except Exception as exc:
+        raise TranscriptionError(f"Failed to download Whisper model '{model_id}': {exc}") from exc
+
+
+def _load_model_safe(model_id: str):
+    """Reuse a context until model, device, or decoder strategy changes.
+
+    Caller must hold _model_lock. Sampling strategy is a constructor option in
+    pywhispercpp; other decoding settings are reset on every transcribe call.
+    """
+    global _model, _model_key
+    settings = get_settings()
+    beam = settings.tune_enabled and settings.tune_beam_size is not None
+    key = (model_id, settings.transcription_device, settings.transcription_gpu_device, beam)
+    if _model is not None and _model_key == key:
+        return _model
+    try:
+        from .whisper_cpp import CheckedModel
+
         model_path = _download_model(model_id)
-        _load_models.load_model(model_path, dtype=mx.float16)
+        # Release old weights before allocating a replacement (important on
+        # machines that only have enough memory for one large model).
+        _model = None
+        _model_key = None
+        use_gpu = settings.transcription_device == "auto"
+        kwargs = dict(
+            params_sampling_strategy=int(beam),
+            context_params={"use_gpu": use_gpu, "gpu_device": settings.transcription_gpu_device},
+            print_progress=False, print_realtime=False, print_timestamps=False,
+        )
+        try:
+            model = CheckedModel(model_path, **kwargs)
+        except Exception:
+            if not use_gpu:
+                raise
+            logger.warning("GPU model initialization failed; retrying on CPU.", exc_info=True)
+            kwargs["context_params"] = {"use_gpu": False}
+            model = CheckedModel(model_path, **kwargs)
+        _model, _model_key = model, key
+        logger.info(
+            "Loaded whisper.cpp model '%s' (device=%s, GPU index=%d). "
+            "Native whisper.cpp logs identify the selected backend; auto falls back to CPU.",
+            model_id, settings.transcription_device, settings.transcription_gpu_device,
+        )
+        return model
     except TranscriptionError:
         raise
-    except (RepositoryNotFoundError, HFValidationError) as exc:
-        raise TranscriptionError(
-            f"Transcription model '{model_id}' was not found. Check the model "
-            "id in Settings — MLX Whisper models use the '-mlx' suffix "
-            "(e.g. mlx-community/whisper-small-mlx)."
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - wrap anything else as a transcription failure
-        raise TranscriptionError(f"Failed to load transcription model '{model_id}': {exc}") from exc
-
-
-def _download_model(model_id: str) -> str:
-    """Return a local model path, downloading a Hugging Face model if needed."""
-    if Path(model_id).expanduser().exists():
-        return str(Path(model_id).expanduser())
-
-    try:
-        logger.info("Ensuring Whisper model '%s' is downloaded.", model_id)
-        return snapshot_download(repo_id=model_id)
-    except (RepositoryNotFoundError, HFValidationError) as exc:
-        raise TranscriptionError(
-            f"Transcription model '{model_id}' was not found. Check the model "
-            "id in Settings — MLX Whisper models use the '-mlx' suffix "
-            "(e.g. mlx-community/whisper-small-mlx)."
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - wrap download failures consistently
-        raise TranscriptionError(
-            f"Failed to download transcription model '{model_id}': {exc}"
-        ) from exc
-
-
-# The model id that was successfully warmed into MLX memory at startup. Used by
-# ``transcribe`` to confirm the preloaded model matches the one it's about to
-# use, so it reuses the cache instead of reloading.
-_warmed_id: str | None = None
-
-
-def _resolve_source(model_id: str) -> str:
-    """Classify the model spec as a local path or a Hugging Face repo id."""
-    if Path(model_id).expanduser().exists():
-        return "local"
-    return "huggingface"
+    except Exception as exc:
+        raise TranscriptionError(f"Failed to load Whisper model '{model_id}': {exc}") from exc
 
 
 def warm_model() -> None:
-    """Load the Whisper model into MLX memory at backend startup.
-
-    Downloads (first time) and loads the weights so the first transcription
-    request doesn't pay that cost. Failures are logged but non-fatal: if the
-    model can't be loaded now (e.g. no network), the first request will attempt
-    it. The loaded model populates MLX Whisper's internal cache keyed by model
-    id, which ``transcribe`` reuses via the id string.
-    """
-    model_id = _model_id()
-    source = _resolve_source(model_id)
-
-    if source == "local":
-        logger.info("Loading Whisper model from local path: %s", model_id)
-    elif _hf_cache_has(model_id):
-        logger.info("Loading Whisper model '%s' from Hugging Face cache.", model_id)
-    else:
-        logger.info(
-            "Downloading Whisper model '%s' from Hugging Face...", model_id
-        )
-
-    start = time.monotonic()
+    """Download and load weights at startup; defer failures to the first job."""
+    started = time.monotonic()
     try:
-        _load_model_safe(model_id)
-        elapsed = time.monotonic() - start
-        logger.info(
-            "Whisper model '%s' loaded into MLX memory in %.1fs.", model_id, elapsed
-        )
-        global _warmed_id
-        _warmed_id = model_id
-    except Exception as exc:  # noqa: BLE001 - don't crash startup on load failure
-        logger.warning(
-            "Could not preload Whisper model '%s' at startup (%s). It will be "
-            "loaded on the first transcription request.",
-            model_id,
-            exc,
-        )
+        with _model_lock:
+            _load_model_safe(_model_id())
+        logger.info("Whisper model ready in %.1fs.", time.monotonic() - started)
+    except Exception as exc:
+        logger.warning("Could not preload Whisper model (%s); the first job will retry.", exc)
 
 
-def _hf_cache_has(model_id: str) -> bool:
-    """Return True if the model already exists in the local HF cache."""
-    try:
-        snapshot_download(model_id, local_files_only=True)
-        return True
-    except Exception:  # noqa: BLE001 - not cached
-        return False
+def _decode(audio: np.ndarray, model_id: str, lang: str | None, options: dict) -> dict:
+    """Adapt whisper.cpp's 10 ms segment ticks to our seconds-based API."""
+    with _model_lock:
+        model = _load_model_safe(model_id)
+        try:
+            segments = model.transcribe(
+                np.ascontiguousarray(audio, dtype=np.float32),
+                language=lang or "auto",
+                # The binding retains decode overrides between calls. Reset
+                # defaults so toggling tuning never leaks the previous options.
+                **{
+                    "no_context": True, "no_speech_thold": 0.6,
+                    "greedy": {"best_of": 5},
+                    "beam_search": {"beam_size": -1, "patience": -1.0},
+                    "suppress_nst": False, **options,
+                },
+            )
+        except Exception as exc:
+            raise TranscriptionError(f"Whisper transcription failed: {exc}") from exc
+        normalized = [
+            {"start": float(s.t0) / 100, "end": float(s.t1) / 100, "text": s.text.strip()}
+            for s in segments
+        ]
+        return {"text": " ".join(s["text"] for s in normalized if s["text"]), "segments": normalized}
 
 
-def transcribe(path: str, language: str | None = None, progress_callback=None) -> TranscriptionResult:
+def _transcribe_locked(path: str, language: str | None = None, progress_callback=None) -> TranscriptionResult:
     """Transcribe an audio file at ``path`` and return text + timed segments.
 
     Runs the pluggable pre-audio-processing modules first (e.g. silence trim),
@@ -172,22 +179,14 @@ def transcribe(path: str, language: str | None = None, progress_callback=None) -
     Args:
         path: Path to the audio file.
         language: Optional language code (e.g., "en"). Defaults to settings.
-        progress_callback: Optional callable(current_chunk, total_chunks) invoked
+        progress_callback: Optional callable(fraction) invoked
             after each chunk is transcribed. Used to report progress for long audio.
     """
     settings = get_settings()
     lang = language or settings.transcription_language
 
     model_id = _model_id()
-    if _warmed_id == model_id:
-        logger.info("Using preloaded Whisper model '%s'.", model_id)
-    else:
-        # Either warm_model() didn't run/succeed, or the configured model
-        # changed; load (and cache) it now. Validating here surfaces a clear
-        # error for a missing/non-existent model id instead of letting the raw
-        # "Repository Not Found / 401" bubble up from the hub client.
-        logger.info("Loading Whisper model '%s' for this request.", model_id)
-        _load_model_safe(model_id)
+    _load_model_safe(model_id)
 
     processed_path = run_audio_transforms(path, settings)
     try:
@@ -232,14 +231,7 @@ def transcribe(path: str, language: str | None = None, progress_callback=None) -
                     "Audio is too short to transcribe. Record at least a second "
                     "of speech and try again."
                 )
-            result = mlx_whisper.transcribe(
-                processed_path,
-                path_or_hf_repo=model_id,
-                language=lang,
-                word_timestamps=False,
-                verbose=False,
-                **collect_transcribe_options(settings),
-            )
+            result = _decode(audio, model_id, lang, collect_transcribe_options(settings))
             if progress_callback:
                 progress_callback(1.0)
     finally:
@@ -267,38 +259,43 @@ def transcribe(path: str, language: str | None = None, progress_callback=None) -
     )
 
 
-def _load_waveform(path: str) -> "mx.array":
-    """Decode an audio file to a mono float32 waveform using mlx_whisper's loader.
-
-    Returns an MLX array (samples at 16 kHz). Raises on decode failure so the
-    caller's existing error handling applies.
-    """
-    return mlx_whisper.audio.load_audio(path)
+def transcribe(path: str, language: str | None = None, progress_callback=None) -> TranscriptionResult:
+    """Serialize access to the native context and retain chunk progress callbacks."""
+    with _model_lock:
+        return _transcribe_locked(path, language, progress_callback)
 
 
-def _load_waveform_np(path: str) -> np.ndarray:
-    """Decode an audio file to a 1-D float32 numpy waveform at 16 kHz.
+def _load_waveform(path: str) -> np.ndarray:
+    """Decode any supported upload to mono float32 PCM at 16 kHz via ffmpeg."""
+    ffmpeg = get_settings().ffmpeg_bin or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise TranscriptionError("ffmpeg not found. Install ffmpeg to decode uploaded audio.")
+    try:
+        decoded = subprocess.run(
+            [ffmpeg, "-nostdin", "-v", "error", "-i", path,
+             "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"],
+            check=True, capture_output=True,
+        )
+        return np.frombuffer(decoded.stdout, dtype="<f4").astype(np.float32)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = exc.stderr.decode(errors="replace").strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+        raise TranscriptionError(f"Could not decode audio: {detail}") from exc
 
-    Silero VAD wants a numpy/torch array (not an MLX array), so the VAD path
-    uses this. mlx_whisper.transcribe also accepts numpy windows fine.
-    """
-    return np.asarray(mlx_whisper.audio.load_audio(path), dtype=np.float32)
 
-
-def _needs_chunking(audio: "mx.array") -> bool:
+def _needs_chunking(audio: np.ndarray) -> bool:
     """True when the audio is long enough that single-pass decode may truncate."""
     return (audio.shape[0] / 16000.0) > _CHUNK_SECONDS
 
 
 def _transcribe_chunked(
-    audio: "mx.array", model_id: str, lang: str | None, options: dict,
+    audio: np.ndarray, model_id: str, lang: str | None, options: dict,
     progress_callback=None,
 ) -> dict:
     """Transcribe long audio by decoding fixed windows and merging the results.
 
     Each window is ``_CHUNK_SECONDS`` of audio with ``_CHUNK_OVERLAP_SECONDS``
     of overlap on the leading edge (so a word cut at a boundary is recovered).
-    ``condition_on_previous_text`` is disabled per chunk: cross-chunk context is
+    Context reuse is disabled per chunk: cross-chunk context is
     what makes large models loop/hallucinate and bail early on long input, and we
     re-assemble the full transcript ourselves. Segment timestamps are shifted by
     each window's start offset so the merged timeline stays continuous.
@@ -314,9 +311,9 @@ def _transcribe_chunked(
     total = int(audio.shape[0])
     # Windows cover [0, chunk), [step, step+chunk), ...; the last window reaches
     # the end of the audio.
-    starts = list(range(0, max(1, total), step))
-    if starts[-1] + chunk_samples < total:
-        starts.append(max(0, total - chunk_samples))
+    starts = [0]
+    while starts[-1] + chunk_samples < total:
+        starts.append(starts[-1] + step)
 
     all_text: list[str] = []
     all_segments: list[dict] = []
@@ -325,22 +322,14 @@ def _transcribe_chunked(
 
     for i, start in enumerate(starts):
         window = audio[start : start + chunk_samples]
-        if window.shape[0] < sr:  # ignore sub-second tails
-            continue
-        chunk_result = mlx_whisper.transcribe(
-            window,
-            path_or_hf_repo=model_id,
-            language=lang,
-            word_timestamps=False,
-            verbose=False,
-            condition_on_previous_text=False,
-            **options,
-        )
+        if window.shape[0] < sr:
+            window = np.pad(window, (0, sr - window.shape[0]))
+        chunk_result = _decode(window, model_id, lang, {**options, "no_context": True})
         if progress_callback:
             progress_callback((i + 1) / total_chunks)
         offset = start / sr
         window_segments = [
-            s for s in chunk_result.get("segments", []) if s.get("end", 0.0) > overlap_skip
+            s for s in chunk_result.get("segments", []) if i == 0 or s.get("end", 0.0) > overlap_skip
         ]
         for seg in window_segments:
             all_segments.append(
@@ -350,7 +339,7 @@ def _transcribe_chunked(
                     "text": seg.get("text", "").strip(),
                 }
             )
-        text = chunk_result.get("text", "").strip()
+        text = " ".join(s.get("text", "").strip() for s in window_segments).strip()
         if text:
             all_text.append(text)
 
@@ -361,13 +350,12 @@ def _transcribe_chunked(
     }
 
 
-def _plan_vad_chunks(audio: "mx.array", settings) -> list[tuple[int, int]] | None:
+def _plan_vad_chunks(audio: np.ndarray, settings) -> list[tuple[int, int]] | None:
     """Detect speech and merge it into transcription chunks.
 
     Returns a list of (start_sample, end_sample) boundaries, or ``None`` if VAD
     fails (so the caller falls back to fixed-window chunking). ``audio`` is the
-    MLX waveform; we re-decode to numpy for VAD (mlx_whisper caches the decode,
-    so this is cheap).
+    same numpy waveform used for transcription, without another decode.
     """
     try:
         np_audio = np.asarray(audio, dtype=np.float32)
@@ -403,7 +391,7 @@ def _plan_vad_chunks(audio: "mx.array", settings) -> list[tuple[int, int]] | Non
 
 
 def _transcribe_vad_chunks(
-    audio: "mx.array",
+    audio: np.ndarray,
     chunks: list[tuple[int, int]],
     model_id: str,
     lang: str | None,
@@ -429,17 +417,9 @@ def _transcribe_vad_chunks(
 
     for i, (start, end) in enumerate(chunks):
         window = np_audio[start:end]
-        if window.shape[0] < sr:  # ignore sub-second tails
-            continue
-        chunk_result = mlx_whisper.transcribe(
-            window,
-            path_or_hf_repo=model_id,
-            language=lang,
-            word_timestamps=False,
-            verbose=False,
-            condition_on_previous_text=False,
-            **options,
-        )
+        if window.shape[0] < sr:
+            window = np.pad(window, (0, sr - window.shape[0]))
+        chunk_result = _decode(window, model_id, lang, {**options, "no_context": True})
         offset = start / sr
         for seg in chunk_result.get("segments", []):
             all_segments.append(

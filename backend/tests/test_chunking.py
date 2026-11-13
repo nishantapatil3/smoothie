@@ -1,14 +1,12 @@
 """Regression test: long recordings must be transcribed in full.
 
-``mlx-whisper`` can stop decoding partway through a single very long clip
-(the large-v3 model has been observed truncating after ~100s), which silently
-drops the rest of the transcript. Smoothie works around this by slicing long
-audio into bounded windows and merging the results. This test pins that
-behavior: a generated multi-minute *speech* clip must yield a transcript that
+Smoothie slices long audio into bounded windows and merges the results. This
+test pins that behavior: a generated multi-minute *speech* clip must yield a transcript that
 spans (almost) the entire duration, not just the first ~100s.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -16,9 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from mlx_whisper.audio import load_audio
 from smoothie import transcription
 
+load_audio = transcription._load_waveform
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("SMOOTHIE_INTEGRATION_TESTS") != "1",
+    reason="set SMOOTHIE_INTEGRATION_TESTS=1 for native speech/model integration tests",
+)
 _SAY = shutil.which("say")
 
 
@@ -43,6 +46,7 @@ def _make_long_speech(path: Path, seconds: float = 180.0) -> None:
     parts: list[Path] = []
     tmp = path.parent
     i = 0
+    elapsed = 0.0
     while True:
         p = tmp / f"_say_{i}.aiff"
         subprocess.run(
@@ -62,7 +66,8 @@ def _make_long_speech(path: Path, seconds: float = 180.0) -> None:
             )
         except Exception:
             dur = 5.0
-        if sum(_dur(q) for q in parts) >= seconds:
+        elapsed += dur
+        if elapsed >= seconds:
             break
         i += 1
         if i > 60:  # safety
@@ -86,20 +91,7 @@ def _make_long_speech(path: Path, seconds: float = 180.0) -> None:
         p.unlink(missing_ok=True)
 
 
-def _dur(path: Path) -> float:
-    try:
-        return float(
-            subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=nw=1:nk=1", str(path)],
-                check=True, capture_output=True, text=True,
-            ).stdout.strip()
-        )
-    except Exception:
-        return 0.0
-
-
-def test_long_audio_is_not_truncated():
+def test_long_audio_is_not_truncated(monkeypatch):
     """A >100s speech clip must produce segments spanning near its full duration."""
     with tempfile.TemporaryDirectory() as tmp:
         clip = Path(tmp) / "long_speech.wav"
@@ -107,7 +99,7 @@ def test_long_audio_is_not_truncated():
 
         # Use the fast tiny model so the test stays quick; the chunking logic is
         # model-independent, so this exercises the same merge path.
-        transcription.get_settings().transcription_model = "mlx-community/whisper-tiny"
+        monkeypatch.setattr(transcription.get_settings(), "transcription_model", "tiny")
         result = transcription.transcribe(str(clip))
 
     assert result.segments, "expected at least one segment"
@@ -115,8 +107,9 @@ def test_long_audio_is_not_truncated():
     assert last_end >= 150.0, f"transcript truncated at {last_end:.1f}s (expected >=150s)"
 
 
-def test_chunked_merge_covers_full_duration():
+def test_chunked_merge_covers_full_duration(monkeypatch):
     """_transcribe_chunked must cover the whole clip, not just the first window."""
+    monkeypatch.setattr(transcription.get_settings(), "transcription_model", "tiny")
     with tempfile.TemporaryDirectory() as tmp:
         clip = Path(tmp) / "long_speech.wav"
         _make_long_speech(clip, seconds=200.0)
@@ -124,7 +117,7 @@ def test_chunked_merge_covers_full_duration():
 
     opts = transcription.collect_transcribe_options(transcription.get_settings())
     res = transcription._transcribe_chunked(
-        audio, "mlx-community/whisper-tiny", "en", opts
+        audio, "tiny", "en", opts
     )
     assert res["segments"], "expected segments from chunked transcription"
     last_end = res["segments"][-1]["end"]

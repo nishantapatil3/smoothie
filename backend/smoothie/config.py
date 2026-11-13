@@ -12,10 +12,10 @@ import asyncio
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 logger = logging.getLogger("smoothie")
 
@@ -46,11 +46,13 @@ class Settings(BaseModel):
     # via the UI (changing it mid-run would orphan the live database).
     data_dir: Path = DATA_DIR
 
-    # --- Transcription provider (MLX Whisper) ---
-    # Any mlx-community whisper model id, or a local path.
-    # Common ids: mlx-community/whisper-tiny (fast), whisper-small,
-    # whisper-medium, whisper-large-v3. Verify availability on HuggingFace.
-    transcription_model: str = "mlx-community/whisper-large-v3-mlx"
+    # --- Transcription provider (whisper.cpp) ---
+    # Model name from ggerganov/whisper.cpp (e.g. tiny, large-v3, small-q8_0),
+    # or a local ggml .bin model file. MLX weights cannot be reused.
+    transcription_model: str = "large-v3"
+    # Auto lets whisper.cpp use an available compiled GPU backend or CPU.
+    transcription_device: Literal["auto", "cpu"] = "auto"
+    transcription_gpu_device: int = Field(default=0, ge=0)
     # Spoken language for transcription. Defaults to "en" (forced, like meetily)
     # for stable, higher-quality results on English meetings. Set to None for
     # auto-detection, or any language code (e.g. "es", "fr").
@@ -121,10 +123,23 @@ class Settings(BaseModel):
     # tune: surface Whisper decode options. None = leave Whisper default
     # (safe/non-mutating). Set to override.
     tune_enabled: bool = True
-    tune_beam_size: int | None = None
+    tune_beam_size: int | None = Field(default=None, ge=1)
     tune_condition_on_previous_text: bool | None = None
-    tune_no_speech_threshold: float | None = None
-    tune_hallucination_silence_threshold: float | None = None
+    tune_no_speech_threshold: float | None = Field(default=None, ge=0, le=1)
+
+    @field_validator("transcription_model")
+    @classmethod
+    def migrate_transcription_model(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("transcription_model cannot be empty")
+        # Preserve the model size selected in configurations from the MLX era.
+        prefix = "mlx-community/whisper-"
+        if value.startswith(prefix):
+            name = value[len(prefix):].removesuffix("-mlx")
+            if name in {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}:
+                return name
+        return value
 
     @property
     def db_url(self) -> str:

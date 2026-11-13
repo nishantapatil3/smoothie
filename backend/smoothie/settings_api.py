@@ -7,7 +7,7 @@ are never returned or accepted. All routes require an authenticated user.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +27,8 @@ class SettingsOut(BaseModel):
     host: str
     port: int
     transcription_model: str
+    transcription_device: Literal["auto", "cpu"]
+    transcription_gpu_device: int
     transcription_language: str | None
     vad_enabled: bool
     vad_threshold: float
@@ -50,7 +52,6 @@ class SettingsOut(BaseModel):
     tune_beam_size: int | None
     tune_condition_on_previous_text: bool | None
     tune_no_speech_threshold: float | None
-    tune_hallucination_silence_threshold: float | None
 
 
 class SettingsUpdate(BaseModel):
@@ -61,6 +62,8 @@ class SettingsUpdate(BaseModel):
     host: str | None = None
     port: int | None = None
     transcription_model: str | None = None
+    transcription_device: Literal["auto", "cpu"] | None = None
+    transcription_gpu_device: int | None = Field(default=None, ge=0)
     transcription_language: str | None = None
     vad_enabled: bool | None = None
     vad_threshold: float | None = None
@@ -84,7 +87,6 @@ class SettingsUpdate(BaseModel):
     tune_beam_size: int | None = None
     tune_condition_on_previous_text: bool | None = None
     tune_no_speech_threshold: float | None = None
-    tune_hallucination_silence_threshold: float | None = None
 
 
 @router.get("", response_model=SettingsOut)

@@ -17,8 +17,13 @@ port: 5173
 # Directory where the sqlite db and uploaded audio live.
 data_dir: data
 
-# --- Transcription provider (MLX Whisper, local) ---
-transcription_model: mlx-community/whisper-large-v3-mlx
+# --- Transcription provider (whisper.cpp, local) ---
+# Model name (tiny/base/small/medium/large-v3), quantized name, or local .bin file.
+transcription_model: large-v3
+# Use an available compiled GPU backend, falling back to CPU; or force cpu.
+transcription_device: auto
+# Native GPU index (used in auto mode).
+transcription_gpu_device: 0
 # Force a language, or empty/null for auto-detect (e.g. "en").
 transcription_language: en
 
@@ -68,4 +73,3 @@ tune_enabled: true
 tune_beam_size: null
 tune_condition_on_previous_text: null
 tune_no_speech_threshold: null
-tune_hallucination_silence_threshold: 2.0

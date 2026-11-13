@@ -110,3 +110,23 @@ def test_put_rejects_invalid_types(client):
         "/api/settings", headers=headers, json={"auth_access_ttl_minutes": "not-an-int"}
     )
     assert res.status_code == 422
+
+
+def test_transcription_device_and_legacy_model_persist(client):
+    token = _register(client)["token"]
+    headers = _auth_header(token)
+    res = client.put("/api/settings", headers=headers, json={
+        "transcription_model": "mlx-community/whisper-small-mlx",
+        "transcription_device": "cpu",
+        "transcription_gpu_device": 1,
+    })
+    assert res.status_code == 200
+    assert res.json()["transcription_model"] == "small"
+    assert res.json()["transcription_device"] == "cpu"
+    assert res.json()["transcription_gpu_device"] == 1
+    config_mod.get_settings.cache_clear()
+    reloaded = config_mod.get_settings()
+    assert reloaded.transcription_model == "small"
+    assert reloaded.transcription_device == "cpu"
+    for invalid in [{"transcription_device": "unknown"}, {"transcription_gpu_device": -1}]:
+        assert client.put("/api/settings", headers=headers, json=invalid).status_code == 422

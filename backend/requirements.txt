@@ -1,6 +1,7 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
-mlx-whisper>=0.1.0
+pywhispercpp==1.5.1
+numpy>=1.24
 huggingface-hub>=0.20
 truststore>=0.10
 silero-vad>=6.0

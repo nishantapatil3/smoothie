@@ -6,7 +6,7 @@ Modules run *before* transcription. There are two kinds:
     normalize loudness). Chained in order; each reads the current file and
     writes a new one, returning the next path.
   * ``TranscribeTuner`` — does not touch the audio; it contributes keyword
-    arguments to ``mlx_whisper.transcribe`` (e.g. beam size, thresholds).
+    arguments to the whisper.cpp decoder (e.g. beam size, thresholds).
 
 Each module is independently enable/disable-able via settings. A transform that
 fails falls back to its input path so a misconfigured filter never kills a job.
@@ -37,7 +37,7 @@ class AudioProcessor(abc.ABC):
 
 
 class TranscribeTuner(abc.ABC):
-    """Contributes kwargs to ``mlx_whisper.transcribe``."""
+    """Contributes kwargs to the whisper.cpp decoder."""
 
     name: str = "base"
 
