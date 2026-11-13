@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger("smoothie")
 
@@ -24,14 +24,15 @@ _settings_lock = asyncio.Lock()
 
 # Project root: backend/ (this file lives in backend/smoothie/)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = BACKEND_ROOT.parent
 DATA_DIR = BACKEND_ROOT / "data"
 
-# config.yaml lives in the backend root. Secrets (summary_key, auth_secret) may
+# config.yaml lives in the backend root. The summary_key secret may
 # be written here, so it should be git-ignored.
 CONFIG_PATH = BACKEND_ROOT / "config.yaml"
 
 # Settings the web UI is not allowed to read or write (secret / DB-stability).
-HIDDEN_SETTINGS = {"auth_secret", "data_dir", "ffmpeg_bin"}
+HIDDEN_SETTINGS = {"data_dir", "ffmpeg_bin", "watch_dir", "output_dir", "codex_bin", "codex_home"}
 
 
 class Settings(BaseModel):
@@ -45,6 +46,31 @@ class Settings(BaseModel):
     # Directory where the sqlite db and uploaded audio live. Not user-editable
     # via the UI (changing it mid-run would orphan the live database).
     data_dir: Path = DATA_DIR
+
+    @field_validator("data_dir", mode="before")
+    @classmethod
+    def resolve_data_dir(cls, value):
+        path = Path(value).expanduser()
+        return (path if path.is_absolute() else BACKEND_ROOT / path).resolve()
+
+    # Paths are resolved relative to the repository, independent of the cwd.
+    watch_dir: Path = REPO_ROOT / "watch"
+    output_dir: Path = REPO_ROOT / "output"
+    watch_enabled: bool = True
+    watch_poll_interval: float = Field(default=2.0, ge=0.1)
+    watch_stable_seconds: float = Field(default=5.0, ge=0)
+
+    @field_validator("watch_dir", "output_dir", mode="before")
+    @classmethod
+    def resolve_folder(cls, value):
+        path = Path(value).expanduser()
+        return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+    @model_validator(mode="after")
+    def check_folders(self):
+        if self.watch_dir == self.output_dir or self.watch_dir.is_relative_to(self.output_dir):
+            raise ValueError("watch_dir must be outside output_dir")
+        return self
 
     # --- Transcription provider (whisper.cpp) ---
     # Model name from ggerganov/whisper.cpp (e.g. tiny, large-v3, small-q8_0),
@@ -80,31 +106,16 @@ class Settings(BaseModel):
     # Optional bearer token; left empty for local/keyless endpoints.
     summary_key: str = ""
     summary_model: str = "llama3.2"
+    # Use the local Codex CLI's ChatGPT sign-in, or an API endpoint.
+    summary_provider: Literal["api", "codex"] = "api"
+    summary_codex_model: str = ""  # empty = installed Codex's default model
+    summary_codex_timeout: float = Field(default=300.0, gt=0)
+    codex_bin: str = ""  # auto-detected on PATH if empty
+    codex_home: Path = Path.home() / ".codex"
 
     # --- Worker ---
     # Polling interval (seconds) for the background job loop.
     job_poll_interval: float = 2.0
-
-    # --- Auth ---
-    # Secret used to sign stateless Bearer access tokens (HMAC-SHA256). Generate
-    # a strong random value and keep it stable across restarts, or existing
-    # tokens become invalid on every boot. If left empty, an ephemeral secret is
-    # generated at startup (tokens won't survive a restart). Not exposed via the
-    # UI for safety — set it in config.yaml directly.
-    auth_secret: str = "changeme"
-    # Access token lifetime in minutes (short-lived; refreshed silently).
-    auth_access_ttl_minutes: int = 60
-    # Refresh token lifetime in days (long-lived; rotated on each use).
-    auth_refresh_ttl_days: int = 7
-    # Minimum accepted password length at registration.
-    auth_min_password_len: int = 8
-
-    # --- Tier administration ---
-    # Usernames allowed to list users and change their subscription tier via
-    # the admin endpoints. Empty = no one can change tiers through the UI/API
-    # (free-tier limits still apply to everyone). Add usernames here to grant
-    # admin rights, e.g. ["admin"].
-    admin_usernames: list[str] = Field(default_factory=list)
 
     # --- Pre-audio-processing (pluggable modules) ---
     # Modules run before transcription. Each is independently enable/disable-able.
@@ -164,9 +175,7 @@ def load_config() -> Settings:
         if not isinstance(data, dict):
             logger.warning("config.yaml is not a mapping; using defaults.")
             return Settings()
-        # Drop keys the UI must not inject; pydantic extra="ignore" also covers
-        # unknown keys defensively.
-        data = {k: v for k, v in data.items() if k not in HIDDEN_SETTINGS}
+        # Hidden paths are configurable in YAML, but never through the API.
         settings = Settings(**data)
         logger.info("Loaded settings from %s", CONFIG_PATH)
         return settings
@@ -176,9 +185,8 @@ def load_config() -> Settings:
 
 
 def save_config(settings: Settings) -> None:
-    """Persist ``settings`` to ``config.yaml`` (hidden fields excluded)."""
-    payload = settings.model_dump()
-    payload = {k: v for k, v in payload.items() if k not in HIDDEN_SETTINGS}
+    """Persist settings, including configured paths, to YAML."""
+    payload = settings.model_dump(mode="json")
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
     logger.info("Saved settings to %s", CONFIG_PATH)
@@ -193,7 +201,7 @@ async def apply_settings(updates: dict[str, Any]) -> Settings:
     """Update the cached settings in place, persist to ``config.yaml``, return it.
 
     ``updates`` is a partial dict of editable fields. Hidden fields
-    (``auth_secret``, ``data_dir``, ``ffmpeg_bin``) and any unknown keys are
+    (``data_dir``, ``ffmpeg_bin``) and any unknown keys are
     ignored. Values are validated/coerced by the ``Settings`` model so e.g. a
     JSON boolean becomes a real ``bool``. Raises ``ValueError`` on invalid data.
 

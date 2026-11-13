@@ -1,6 +1,6 @@
 # Smoothie
 
-A privacy-first, **fully local** audio transcription + summarization service.
+A privacy-first, **local-first** audio transcription + summarization service.
 Modeled on [meetily](https://github.com/Zackriya-Solutions/meetily), but with a
 **Python backend** and **whisper.cpp** for on-device transcription.
 
@@ -106,18 +106,64 @@ npm run dev        # http://localhost:5174  (proxies /api -> :5173)
 Open http://localhost:5174, record or upload audio, and watch the transcript +
 summary appear.
 
-### First run / accounts
+### Automatic folder imports
 
-Smoothie is multi-user. On first open the web UI shows a login screen — click
-**"Need an account? Register"** to create the first account. Set a stable
-`auth_secret` in `config.yaml` (e.g. `openssl rand -hex 32`) so issued tokens
-survive backend restarts; without it an ephemeral secret is generated each boot
-and you will be logged out on restart.
+Starting the backend creates **`watch/`** and **`output/`** at the repository
+root. Drop supported audio into `watch/` (including subfolders); Smoothie waits
+for its size and modification time to remain unchanged for five seconds, then
+copies it and queues the normal transcription/summary job. Originals are never
+moved or deleted. Both directories are git-ignored.
 
-> **Upgrading an existing database:** pre-auth recordings had no owner. The
-> `user_id` column is added automatically, but those legacy rows keep an empty
-> owner and are hidden from all accounts. Start fresh (or re-import) for a
-> fully-owned library.
+Each recording, including new web uploads, gets an output directory:
+
+```text
+output/meeting-<recording-id>/
+  audio.m4a
+  transcript.txt
+  transcript.json
+  summary.md
+  metadata.json
+```
+
+Transcripts are exported as soon as transcription is saved, even if the summary
+provider fails. Metadata records status, errors, original filename, and (for
+folder imports) the source path and copied content's SHA-256. Files are written
+atomically. SQLite tracks imports, jobs, and exports that still need writing;
+restart recovery resumes incomplete copies and retries unfinished exports.
+Existing recordings continue to use their original audio location.
+
+Common formats include WAV, MP3, M4A/M4B, FLAC, OGG, Opus, AAC, AIFF, WMA,
+CAF, ALAC, AMR, APE, and audio-bearing MP4/WebM containers. Files must be readable
+by the installed FFmpeg decoder; invalid audio appears as a failed job. Hidden
+files, symlinks, and the output subtree are excluded. File readiness is a
+heuristic: producers should finish writing before moving/renaming files into
+`watch/` if they can pause writing for more than five seconds.
+
+The same source path, size, and modification time is imported only once, even
+across restarts or after deleting its recording. A changed file is a new import;
+a file at another path is also a separate import. Copies interrupted by shutdown
+are recovered before enqueueing. Temporary copy failures remain recorded and
+are retried on later scans. Use a **single backend worker process**.
+
+Configure `watch_enabled`, `watch_poll_interval`, and `watch_stable_seconds` in
+Settings or YAML. Set `watch_dir` and `output_dir` in `backend/config.yaml` to
+change paths (restart required); relative paths resolve from the repo root.
+Output may be inside the watched tree and is excluded automatically, but the
+watched directory cannot be inside output. Deleting a recording removes its
+managed audio and generated files; its watched original is preserved.
+
+### First run
+
+Open the dashboard and start recording or uploading audio immediately. There
+are no accounts, login screens, subscriptions, or transcription usage caps.
+Each deployment has one shared recording library and shared settings; everyone
+who can reach the deployment can view, upload, delete, and reprocess recordings
+and edit settings.
+
+On upgrade, recordings from every former account are retained in that shared
+library, including transcripts, summaries, and jobs. Existing account/session
+tables are left unused; new databases do not create them. Old authentication
+and tier configuration keys are ignored and removed on the next settings save.
 
 ### Single-process production mode
 
@@ -161,23 +207,19 @@ All settings live in **`backend/config.yaml`** (YAML), the single source of
 truth — there are no environment variables. A fully-commented template is at
 `backend/config.yaml.example`; copy it to `config.yaml` and adjust, or just let
 the server create one on first save. **`config.yaml` is git-ignored** (it can
-hold secrets like `summary_key` / `auth_secret`); only `config.yaml.example` is
+hold secrets like `summary_key`); only `config.yaml.example` is
 committed.
 
 The web UI has a **Settings** page (⚙ in the header) that reads and edits every
 setting live — changes apply immediately and are written back to `config.yaml`.
-`auth_secret`, `data_dir`, and `ffmpeg_bin` are **not** exposed in the UI
-(secret / database-stability); set those directly in `config.yaml`.
+`data_dir` and `ffmpeg_bin` are **not** exposed in the UI
+(local paths / database stability); set those directly in `config.yaml`.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `host` | `0.0.0.0` | Bind address for the backend server |
 | `port` | `5173` | Port the backend listens on |
 | `job_poll_interval` | `2.0` | Background job loop polling interval (seconds) |
-| `auth_secret` | _(ephemeral)_ | Secret signing access tokens (HMAC). Set a stable random value so tokens survive restarts |
-| `auth_access_ttl_minutes` | `60` | Access token lifetime in minutes (refreshed silently) |
-| `auth_refresh_ttl_days` | `7` | Refresh token lifetime in days (rotated on each use) |
-| `auth_min_password_len` | `8` | Minimum password length at registration |
 | `transcription_model` | `large-v3` | whisper.cpp model name, quantized name, or local ggml `.bin` file |
 | `transcription_device` | `auto` | Use an available compiled GPU backend, falling back to CPU; `cpu` disables GPU inference |
 | `transcription_gpu_device` | `0` | Native GPU index used in automatic mode |
@@ -231,8 +273,39 @@ recording. A regression test in `backend/tests/test_trim.py` pins this.
 
 ### Enabling summaries
 
-The backend talks to **one** OpenAI-compatible endpoint — the summarizer LLM.
-Point it wherever you want; it's your choice:
+Choose **OpenAI-compatible API** or **ChatGPT subscription via Codex** in Settings.
+
+**ChatGPT subscription (local Mac/desktop deployment):** Install the official
+[Codex CLI](https://learn.chatgpt.com/docs/cli), then run `codex login` and sign
+in with ChatGPT. Check `codex login status` before selecting the provider:
+
+```yaml
+summary_provider: codex
+summary_codex_model: ""  # use the CLI's default model
+summary_codex_timeout: 300.0
+# Optional if Codex is not on the backend's PATH:
+# codex_bin: /opt/homebrew/bin/codex
+codex_home: ~/.codex
+```
+
+Smoothie invokes `codex exec` with structured output and lets the CLI manage
+its own ChatGPT credentials, including `auth.json` and refreshes. Credentials
+are never copied into Smoothie configuration, returned through its API, or
+committed. Runs are ephemeral, outside the repository, in a read-only sandbox
+with shell, browsing, app/plugin integrations, and hooks disabled. No personal
+Codex configuration is loaded. This is a local integration, not a hosted Codex
+execution service. See [Codex authentication](https://learn.chatgpt.com/docs/auth?surface=cli)
+and [non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
+
+Transcripts are sent to OpenAI; only transcription stays on-device. Requests
+use the account's Codex allowance and can fail when its usage limits are reached.
+A failed summary leaves the transcript available for summary-only retries.
+Run the backend as the same OS user who signed into Codex. Keep subscription
+usage within a trusted local deployment; public/hosted services should use an
+API provider or the applicable official Sign in with ChatGPT integration.
+
+For an **API endpoint**, set `summary_provider: api`. The backend sends
+`/chat/completions` requests to your configured local or remote summarizer:
 
 **Local summarizer LLM** (default, fully offline — e.g. a local OpenAI-compatible server):
 
@@ -248,7 +321,7 @@ summary_key: "sk-..."
 summary_model: gpt-4o-mini
 ```
 
-The same code path handles all of them — there is no separate Ollama vs cloud mode.
+The API provider uses the same code path for local and remote endpoints.
 You can also change these from the web UI **Settings** page without restarting.
 
 ## API
@@ -256,33 +329,16 @@ You can also change these from the web UI **Settings** page without restarting.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET`  | `/api/health` | Server status + active model/provider (public) |
-| `POST` | `/api/auth/register` | Create an account → returns `{ token, refresh_token }` |
-| `POST` | `/api/auth/login` | Log in with `username`/`password` → `{ token, refresh_token }` |
-| `POST` | `/api/auth/refresh` | Swap a `refresh_token` for a fresh `{ token, refresh_token }` (old one revoked) |
-| `POST` | `/api/auth/logout` | Revoke a `refresh_token` for the authenticated user |
-| `GET`  | `/api/auth/me` | Current user (requires Bearer token) |
-| `GET`  | `/api/settings` | Current editable settings (requires Bearer token) |
-| `PUT`  | `/api/settings` | Update settings live + persist to `config.yaml` (requires Bearer token) |
-| `POST` | `/api/recordings` | Upload audio (`multipart`: `audio`, optional `title`,`language`) — requires auth |
-| `GET`  | `/api/recordings` | List **your** recordings (newest first) — requires auth |
-| `GET`  | `/api/recordings/{id}` | Full detail: status, transcript, summary — requires auth, owner only |
-| `GET`  | `/api/recordings/{id}/audio` | Download the original audio — requires auth, owner only |
-| `DELETE` | `/api/recordings/{id}` | Delete a recording + its audio — requires auth, owner only |
+| `GET`  | `/api/settings` | Current editable settings |
+| `PUT`  | `/api/settings` | Update settings live + persist to `config.yaml` |
+| `POST` | `/api/recordings` | Upload audio (`multipart`: `audio`, optional `title`,`language`) |
+| `GET`  | `/api/recordings` | List all recordings (newest first) |
+| `GET`  | `/api/recordings/{id}` | Full detail: status, transcript, summary |
+| `GET`  | `/api/recordings/{id}/audio` | Download the original audio |
+| `DELETE` | `/api/recordings/{id}` | Delete a recording + its audio |
 
-All `/api/recordings*` routes require an `Authorization: Bearer <token>` header
-issued by `/api/auth/login` (or `/api/auth/register`). Recordings are scoped to
-the owning user — one user cannot see or fetch another's recordings.
-
-**Token model (Ring-style).** Login/register return a short-lived **access
-token** (default 60 min, `auth_access_ttl_minutes`) plus a longer-lived
-**refresh token** (default 7 days, `auth_refresh_ttl_days`). When an
-access token expires (API returns 401), the client calls `POST /api/auth/refresh`
-with its refresh token to obtain a new pair — no re-login needed. Each refresh
-**rotates** the refresh token (the old one is revoked), and `POST
-/api/auth/logout` revokes it, so a leaked refresh token has a bounded lifetime
-and can be invalidated. Refresh tokens are stored only as SHA-256 hashes in the
-`refresh_tokens` table (never the raw value), so they remain valid across
-restarts as long as `auth_secret` is stable.
+Recording and settings APIs work without authorization headers. Progress events
+are available at `GET /api/recordings/{id}/events` without a token.
 
 Job statuses: `pending → transcribing → summarizing → completed` (or `failed`).
 
@@ -293,11 +349,11 @@ smoothie/
   backend/
     smoothie/         FastAPI app, whisper.cpp, summary providers, SQLite, preprocess modules
     config.yaml.example  Config template (copy to config.yaml)
-    tests/            pytest suite (trim regression, progress/status, auth, settings)
+    tests/            pytest suite (recordings, jobs, migration, transcription, settings)
   webui/              React + Vite client
 ```
 
 ## Out of scope (future iterations)
 
 Speaker diarization, live/streaming transcription, mobile apps, multiple summary
-styles, cloud sync. (Auth & multi-user accounts **are** supported — see above.)
+styles, cloud sync.

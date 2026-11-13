@@ -3,7 +3,7 @@ import { getSettings, saveSettings } from "../api";
 import type { Settings as SettingsDto, SettingsUpdate } from "../types/api";
 import { cn } from "../lib/utils";
 
-export default function Settings({ onTierChanged }: { onTierChanged: () => void }) {
+export default function Settings() {
   const [settings, setSettings] = useState<SettingsDto | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -40,7 +40,6 @@ export default function Settings({ onTierChanged }: { onTierChanged: () => void 
       });
       await saveSettings(updates as SettingsUpdate);
       setMessage({ type: "success", text: "Settings saved" });
-      onTierChanged();
     } catch (err) {
       setMessage({ type: "error", text: err instanceof Error ? err.message : "Failed to save" });
     } finally {
@@ -139,9 +138,58 @@ export default function Settings({ onTierChanged }: { onTierChanged: () => void 
 
         <section className="card">
           <div className="p-4 border-b border-gray-200">
+            <h2 className="text-lg font-semibold text-gray-900">Folder imports</h2>
+          </div>
+          <div className="p-4 space-y-4">
+            <label className="flex items-center gap-3 text-sm font-medium text-gray-700">
+              <input type="checkbox" checked={settings.watch_enabled}
+                onChange={(e) => handleChange("watch_enabled", e.target.checked)}
+                className="h-4 w-4 rounded border-gray-300" />
+              Automatically import audio from the watch folder
+            </label>
+            <p className="hint">Originals stay in the watch folder. Smoothie saves audio copies, transcripts, and summaries in the output folder. Folder paths are configured in config.yaml.</p>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="label">Scan interval (seconds)</label>
+                <input type="number" min="0.1" step="0.1" className="input"
+                  value={settings.watch_poll_interval}
+                  onChange={(e) => handleChange("watch_poll_interval", parseFloat(e.target.value))} />
+              </div>
+              <div>
+                <label className="label">Wait for unchanged file (seconds)</label>
+                <input type="number" min="0" step="1" className="input"
+                  value={settings.watch_stable_seconds}
+                  onChange={(e) => handleChange("watch_stable_seconds", parseFloat(e.target.value))} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="p-4 border-b border-gray-200">
             <h2 className="text-lg font-semibold text-gray-900">Summarization</h2>
           </div>
           <div className="p-4 space-y-4">
+            <div>
+              <label className="label">Provider</label>
+              <select className="input" value={settings.summary_provider}
+                onChange={(e) => handleChange("summary_provider", e.target.value)}>
+                <option value="api">OpenAI-compatible API</option>
+                <option value="codex">ChatGPT subscription via Codex</option>
+              </select>
+            </div>
+            {settings.summary_provider === "codex" ? (
+              <>
+                <p className="hint">Uses this machine's Codex ChatGPT sign-in and Codex usage allowance. Transcripts are sent to OpenAI for summarization.</p>
+                <div>
+                  <label className="label">Codex model (optional)</label>
+                  <input type="text" className="input" value={settings.summary_codex_model}
+                    onChange={(e) => handleChange("summary_codex_model", e.target.value)}
+                    placeholder="Use Codex default" />
+                </div>
+              </>
+            ) : (
+              <>
             <div>
               <label className="label">LLM Endpoint URL</label>
               <input
@@ -175,6 +223,8 @@ export default function Settings({ onTierChanged }: { onTierChanged: () => void 
                 placeholder="llama3.2"
               />
             </div>
+              </>
+            )}
           </div>
         </section>
 
@@ -215,55 +265,6 @@ export default function Settings({ onTierChanged }: { onTierChanged: () => void 
                   className="input"
                 />
               </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="card">
-          <div className="p-4 border-b border-gray-200">
-            <h2 className="text-lg font-semibold text-gray-900">Authentication</h2>
-          </div>
-          <div className="p-4 space-y-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="label">Access Token TTL (minutes)</label>
-                <input
-                  type="number"
-                  value={settings.auth_access_ttl_minutes}
-                  onChange={(e) => handleChange("auth_access_ttl_minutes", parseInt(e.target.value, 10))}
-                  className="input"
-                />
-              </div>
-              <div>
-                <label className="label">Refresh Token TTL (days)</label>
-                <input
-                  type="number"
-                  value={settings.auth_refresh_ttl_days}
-                  onChange={(e) => handleChange("auth_refresh_ttl_days", parseInt(e.target.value, 10))}
-                  className="input"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="label">Min Password Length</label>
-              <input
-                type="number"
-                value={settings.auth_min_password_len}
-                onChange={(e) => handleChange("auth_min_password_len", parseInt(e.target.value, 10))}
-                className="input"
-              />
-            </div>
-
-            <div>
-              <label className="label">Admin Usernames (comma-separated)</label>
-              <input
-                type="text"
-                value={settings.admin_usernames.join(", ")}
-                onChange={(e) => handleChange("admin_usernames", e.target.value.split(",").map(s => s.trim()).filter(Boolean))}
-                className="input"
-                placeholder="admin, admin2"
-              />
             </div>
           </div>
         </section>

@@ -19,31 +19,30 @@ import truststore
 
 truststore.inject_into_ssl()
 
-import structlog
 from fastapi import FastAPI, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .config import get_settings
+from .config import REPO_ROOT, get_settings
 from . import __version__
-from . import admin_api, auth, settings_api, transcription
+from . import settings_api
 from .db import async_session, get_session, init_db
-from .models import Job, JobStage, Recording, User
-from .tiers import UNLIMITED, can_transcribe
+from .models import FolderImport, Job, JobStage, Recording
 from .schemas import (
     HealthOut,
     RecordingDetail,
     RecordingListItem,
     SegmentOut,
 )
-from .auth import get_current_user
-from .storage import audio_duration_sec, audio_path, delete_audio, save_audio
+from .storage import audio_path, delete_audio, save_audio
 from .tasks import regenerate_title, reprocess, retry_summary, start_worker, stop_worker
 from .logging_config import configure_logging, set_request_id, clear_request_id, get_logger
 from .metrics import metrics_response
+from .artifacts import commit_recording, export_recording, recording_files_lock
+from .watcher import watcher
 
 logger = get_logger(__name__)
 
@@ -53,7 +52,7 @@ settings = get_settings()
 app = FastAPI(title="Smoothie", version="0.1.0")
 
 # Directory that may contain the built web UI (repo-root webui/dist). Optional.
-UI_DIST = settings.data_dir.parent.parent / "webui" / "dist"
+UI_DIST = REPO_ROOT / "webui" / "dist"
 
 
 # Request ID middleware for logging method and endpoint
@@ -76,6 +75,7 @@ async def _startup() -> None:
     logger.info("Application starting up")
     await init_db()
     logger.info("Database initialized")
+    await watcher.start()
     await start_worker()
     logger.info("Background worker started")
 
@@ -83,18 +83,22 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     logger.info("Application shutting down")
+    await watcher.stop()
     await stop_worker()
     logger.info("Background worker stopped")
 
 
 @app.get("/api/health", response_model=HealthOut)
 async def health() -> HealthOut:
+    settings = get_settings()
     return HealthOut(
         status="ok",
         version=__version__,
         transcription_model=settings.transcription_model,
-        summary_url=settings.summary_url,
-        summary_model=settings.summary_model,
+        summary_url=settings.summary_url if settings.summary_provider == "api" else "",
+        summary_model=(settings.summary_model if settings.summary_provider == "api"
+                       else settings.summary_codex_model or "Codex default"),
+        summary_provider=settings.summary_provider,
     )
 
 
@@ -104,9 +108,7 @@ async def metrics():
     return metrics_response()
 
 
-app.include_router(auth.router)
 app.include_router(settings_api.router)
-app.include_router(admin_api.router)
 
 
 @app.post("/api/recordings", response_model=RecordingListItem, status_code=201)
@@ -115,38 +117,17 @@ async def create_recording(
     title: str | None = Form(default=None),
     language: str | None = Form(default=None),
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> RecordingListItem:
     data = await audio.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty audio file.")
 
-    filename, abs_path = save_audio(data, audio.content_type)
-
-    # Reject uploads that exceed the user's remaining transcription budget
-    # before they are queued (the worker also enforces the cap, but this gives
-    # immediate feedback and avoids a doomed job). Unlimited tiers skip this.
-    _, _, limit = can_transcribe(user.tier, float(user.usage_minutes))
-    if limit is not UNLIMITED:
-        duration = audio_duration_sec(abs_path)
-        if duration is not None:
-            # limit/usage_minutes are in minutes; duration is in seconds.
-            remaining_min = max(0.0, limit - float(user.usage_minutes))
-            duration_min = duration / 60.0
-            if duration_min > remaining_min:
-                delete_audio(filename)
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"This audio is {duration_min:.1f} min but you have "
-                        f"{remaining_min:.1f} min of transcription remaining on "
-                        f"the {user.tier} tier. Upgrade or trim the clip to "
-                        "continue."
-                    ),
-                )
+    recording_id = uuid.uuid4().hex
+    filename, abs_path = save_audio(data, audio.content_type, audio.filename, recording_id)
 
     recording = Recording(
-        user_id=user.id,
+        id=recording_id, original_filename=audio.filename,
+        output_path=str(Path(abs_path).parent),
         title=title or audio.filename,
         filename=filename,
         content_type=audio.content_type,
@@ -158,19 +139,18 @@ async def create_recording(
     session.add(Job(recording_id=recording.id, stage=JobStage.PENDING))
     await session.commit()
     await session.refresh(recording)
+    await export_recording(recording.id)
     return RecordingListItem.model_validate(recording)
 
 
 @app.get("/api/recordings", response_model=list[RecordingListItem])
 async def list_recordings(
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[RecordingListItem]:
     result = await session.execute(
         select(Recording)
-        .where(Recording.user_id == user.id)
         .options(selectinload(Recording.job))
         .order_by(Recording.created_at.desc())
         .limit(limit)
@@ -194,11 +174,10 @@ async def list_recordings(
 async def get_recording(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> RecordingDetail:
     result = await session.execute(
         select(Recording)
-        .where(Recording.id == recording_id, Recording.user_id == user.id)
+        .where(Recording.id == recording_id)
         .options(
             selectinload(Recording.transcript),
             selectinload(Recording.summary),
@@ -239,29 +218,31 @@ async def get_recording(
 async def delete_recording(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> None:
     recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
-    delete_audio(recording.filename)
-    await session.delete(recording)
-    await session.commit()
+    async with recording_files_lock:
+        delete_audio(recording.filename, recording.output_path)
+        await session.execute(update(FolderImport).where(
+            FolderImport.recording_id == recording_id
+        ).values(recording_id=None))
+        await session.delete(recording)
+        await session.commit()
 
 
 @app.post("/api/recordings/{recording_id}/retry-summary", status_code=200)
 async def retry_recording_summary(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> dict:
     """Re-run only the summarization step (transcript already exists).
 
     Returns 409 if the recording has no transcript yet (use a full retry
-    instead) and 404 if it doesn't belong to the caller.
+    instead) and 404 if the recording does not exist.
     """
     recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
     ok = await retry_summary(recording_id)
     if not ok:
@@ -276,16 +257,15 @@ async def retry_recording_summary(
 async def regenerate_recording_title(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> dict:
     """Regenerate the short title from the recording's existing summary.
 
     Title-only (no re-transcribe / re-summarize). Returns 404 if the recording
-    doesn't belong to the caller, and 409 if it has no summary yet (run a full
+    does not exist, and 409 if it has no summary yet (run a full
     summary first).
     """
     recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
     title = await regenerate_title(recording_id)
     if title is None:
@@ -300,15 +280,14 @@ async def regenerate_recording_title(
 async def reprocess_recording(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> dict:
     """Reset the job to PENDING so the worker will re-transcribe and re-summarize.
 
     Equivalent to a full retry; title/regeneration will be recomputed from the
-    new transcript. Returns 404 if the recording doesn't belong to the caller.
+    new transcript. Returns 404 if the recording does not exist.
     """
     recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
     await reprocess(recording_id)
     return {"ok": True, "status": "pending"}
@@ -318,12 +297,11 @@ async def reprocess_recording(
 async def get_audio(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> FileResponse:
     recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
-    path = audio_path(recording.filename)
+    path = audio_path(recording.filename, recording.output_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing.")
     return FileResponse(str(path), media_type=recording.content_type or "audio/webm")
@@ -333,15 +311,16 @@ async def get_audio(
 async def cancel_recording_job(
     recording_id: str,
     session: AsyncSession = Depends(get_session),
-    user: User = Depends(get_current_user),
 ) -> dict:
     """Cancel a running job for a recording.
 
     Only works if the job is in PENDING, TRANSCRIBING, or SUMMARIZING stage.
     Returns the updated job status.
     """
-    recording = await session.get(Recording, recording_id)
-    if recording is None or recording.user_id != user.id:
+    recording = await session.get(
+        Recording, recording_id, options=[selectinload(Recording.job)]
+    )
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
 
     job = recording.job
@@ -360,7 +339,7 @@ async def cancel_recording_job(
     job.stage = JobStage.CANCELLED
     job.error = "Job cancelled by user"
     recording.status = JobStage.CANCELLED
-    await session.commit()
+    await commit_recording(session, recording)
 
     return {"ok": True, "status": "cancelled", "message": "Job cancelled successfully"}
 
@@ -369,7 +348,6 @@ async def cancel_recording_job(
 async def recording_events(
     recording_id: str,
     request: Request,
-    token: str | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
 ):
     """Server-Sent Events endpoint for real-time job progress updates.
@@ -377,27 +355,7 @@ async def recording_events(
     Streams job progress updates as they happen. The client receives events
     with the current job stage, progress percentage, and any error messages.
 
-    Accepts auth token either as Bearer header or ?token= query parameter
-    (for EventSource compatibility which doesn't support custom headers).
     """
-    # Try to authenticate via token query param (for EventSource) or Bearer header
-    user = None
-    auth_token = token
-
-    # If no query param token, try to extract from Authorization header
-    if not auth_token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            auth_token = auth_header[7:]  # Remove "Bearer " prefix
-
-    if auth_token:
-        user_id = auth.verify_token(auth_token)
-        if user_id:
-            user = await session.get(User, user_id)
-
-    if user is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
     recording = (
         await session.execute(
             select(Recording)
@@ -405,7 +363,7 @@ async def recording_events(
             .options(selectinload(Recording.job))
         )
     ).scalar_one_or_none()
-    if recording is None or recording.user_id != user.id:
+    if recording is None:
         raise HTTPException(status_code=404, detail="Recording not found.")
 
     job = recording.job
@@ -475,6 +433,8 @@ if UI_DIST.exists():
 
     @app.get("/{full_path:path}")
     async def serve_ui(full_path: str) -> FileResponse:
+        if full_path == "api" or full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found.")
         index = UI_DIST / "index.html"
         requested = UI_DIST / full_path
         if full_path and requested.exists() and requested.is_file():

@@ -2,19 +2,17 @@
 
 ``GET /api/settings`` returns the current (editable) settings; ``PUT
 /api/settings`` applies a partial update live and persists it to
-``config.yaml``. Hidden fields (``auth_secret``, ``data_dir``, ``ffmpeg_bin``)
-are never returned or accepted. All routes require an authenticated user.
+``config.yaml``. Hidden fields (``data_dir``, ``ffmpeg_bin``)
+are never returned or accepted. Settings are shared by this deployment.
 """
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .auth import get_current_user
-from .config import HIDDEN_SETTINGS, Settings, apply_settings, get_settings
-from .models import User
+from .config import HIDDEN_SETTINGS, apply_settings, get_settings
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -40,11 +38,13 @@ class SettingsOut(BaseModel):
     summary_url: str
     summary_key: str
     summary_model: str
+    summary_provider: Literal["api", "codex"]
+    summary_codex_model: str
+    summary_codex_timeout: float
     job_poll_interval: float
-    auth_access_ttl_minutes: int
-    auth_refresh_ttl_days: int
-    auth_min_password_len: int
-    admin_usernames: list[str]
+    watch_enabled: bool
+    watch_poll_interval: float
+    watch_stable_seconds: float
     trim_enabled: bool
     trim_threshold: int
     trim_min_silence: float
@@ -75,11 +75,13 @@ class SettingsUpdate(BaseModel):
     summary_url: str | None = None
     summary_key: str | None = None
     summary_model: str | None = None
+    summary_provider: Literal["api", "codex"] | None = None
+    summary_codex_model: str | None = None
+    summary_codex_timeout: float | None = Field(default=None, gt=0)
     job_poll_interval: float | None = None
-    auth_access_ttl_minutes: int | None = None
-    auth_refresh_ttl_days: int | None = None
-    auth_min_password_len: int | None = None
-    admin_usernames: list[str] | None = None
+    watch_enabled: bool | None = None
+    watch_poll_interval: float | None = Field(default=None, ge=0.1)
+    watch_stable_seconds: float | None = Field(default=None, ge=0)
     trim_enabled: bool | None = None
     trim_threshold: int | None = None
     trim_min_silence: float | None = None
@@ -90,7 +92,7 @@ class SettingsUpdate(BaseModel):
 
 
 @router.get("", response_model=SettingsOut)
-async def get_settings_route(user: User = Depends(get_current_user)) -> SettingsOut:
+async def get_settings_route() -> SettingsOut:
     settings = get_settings()
     return SettingsOut.model_validate(settings.model_dump())
 
@@ -98,7 +100,6 @@ async def get_settings_route(user: User = Depends(get_current_user)) -> Settings
 @router.put("", response_model=SettingsOut)
 async def update_settings(
     body: SettingsUpdate,
-    user: User = Depends(get_current_user),
 ) -> SettingsOut:
     updates: dict[str, Any] = {
         k: v for k, v in body.model_dump(exclude_unset=True).items()

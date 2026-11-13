@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import text
+from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -31,12 +31,20 @@ async def init_db() -> None:
     # Import models so they register on Base.metadata before create_all.
     from . import models  # noqa: F401
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        logger.debug("Database tables created")
-        # create_all only adds missing tables, not new columns on existing
-        # tables. Add any columns introduced after first deploy (idempotent).
-        await _migrate_columns(conn)
+    async with engine.connect() as conn:
+        # Rebuilding the legacy recordings table must not cascade-delete its
+        # transcripts/jobs. SQLite only changes this pragma outside a transaction.
+        foreign_keys = await conn.scalar(text("PRAGMA foreign_keys"))
+        await conn.commit()
+        await conn.execute(text("PRAGMA foreign_keys=OFF"))
+        await conn.commit()
+        try:
+            async with conn.begin():
+                await conn.run_sync(Base.metadata.create_all)
+                await _migrate_columns(conn)
+        finally:
+            await conn.execute(text(f"PRAGMA foreign_keys={int(bool(foreign_keys))}"))
+            await conn.commit()
     logger.info("Database initialization complete")
 
 
@@ -78,23 +86,19 @@ async def _migrate_columns(conn) -> None:
             )
         )
 
-    # The users table + recordings.user_id were added with the auth feature.
-    # On a pre-auth database, recordings has no user_id column yet, and the
-    # users table may not exist. Add the column (NOT NULL needs a default;
-    # legacy rows keep their data but become orphaned until reassigned).
     logger.debug("Checking for missing columns in recordings table")
     existing_recordings = {
         row[1]
         for row in await conn.execute(text("PRAGMA table_info(recordings)"))
     }
-    if "user_id" not in existing_recordings:
-        logger.info("Adding user_id column to recordings table")
-        await conn.execute(
-            text(
-                "ALTER TABLE recordings ADD COLUMN user_id "
-                "VARCHAR(32) NOT NULL DEFAULT ''"
-            )
-        )
+    for column, definition in {
+        "original_filename": "TEXT",
+        "output_path": "TEXT",
+        "artifacts_dirty": "BOOLEAN NOT NULL DEFAULT 0",
+        "artifact_revision": "INTEGER NOT NULL DEFAULT 0",
+    }.items():
+        if column not in existing_recordings:
+            await conn.execute(text(f"ALTER TABLE recordings ADD COLUMN {column} {definition}"))
     # LLM-generated short title (3-4 words) added with the auto-title feature.
     if "generated_title" not in existing_recordings:
         logger.info("Adding generated_title column to recordings table")
@@ -105,30 +109,33 @@ async def _migrate_columns(conn) -> None:
             )
         )
 
-    # Subscription tier + lifetime usage counters added with the tiers feature.
-    # On a pre-tiers database, the users table has neither column; add them
-    # with safe defaults (free tier, zero usage).
-    logger.debug("Checking for missing columns in users table")
-    existing_users = {
-        row[1]
-        for row in await conn.execute(text("PRAGMA table_info(users)"))
-    }
-    if "tier" not in existing_users:
-        logger.info("Adding tier column to users table")
-        await conn.execute(
-            text(
-                "ALTER TABLE users ADD COLUMN tier VARCHAR(16) "
-                "NOT NULL DEFAULT 'free'"
-            )
-        )
-    if "usage_minutes" not in existing_users:
-        logger.info("Adding usage_minutes column to users table")
-        await conn.execute(
-            text(
-                "ALTER TABLE users ADD COLUMN usage_minutes "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        )
+    if "user_id" in existing_recordings:
+        await _remove_recording_ownership(conn)
+
+
+async def _remove_recording_ownership(conn) -> None:
+    """Preserve all recordings and dependent rows while removing the owner FK.
+
+    Old account/session tables are left untouched as inactive legacy data.
+    Fresh databases never create them. Rebuilding is necessary because the old
+    NOT NULL foreign key would prevent uploads without an account.
+    """
+    from .models import Recording
+
+    logger.info("Migrating recordings to the shared library")
+    replacement = Recording.__table__.to_metadata(
+        MetaData(), name="recordings_without_accounts"
+    )
+    # If a prior attempt stopped before copying, the source is still authoritative.
+    await conn.execute(text("DROP TABLE IF EXISTS recordings_without_accounts"))
+    await conn.run_sync(lambda sync: replacement.create(sync))
+    columns = ", ".join(f'"{column.name}"' for column in Recording.__table__.columns)
+    await conn.execute(text(
+        f"INSERT INTO recordings_without_accounts ({columns}) "
+        f"SELECT {columns} FROM recordings"
+    ))
+    await conn.execute(text("DROP TABLE recordings"))
+    await conn.execute(text("ALTER TABLE recordings_without_accounts RENAME TO recordings"))
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

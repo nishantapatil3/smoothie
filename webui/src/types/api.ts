@@ -1,15 +1,4 @@
 // Type definitions for the Smoothie API
-export interface User {
-  id: string;
-  username: string;
-  created_at: string;
-  tier: "free" | "standard" | "pro";
-  usage_minutes: number;
-  tier_limit_minutes: number | null;
-  tier_remaining_minutes: number | null;
-  is_admin: boolean;
-}
-
 export type JobStage = "pending" | "transcribing" | "summarizing" | "completed" | "failed" | "cancelled";
 
 export interface RecordingListItem {
@@ -34,10 +23,11 @@ export interface RecordingDetail extends Recording {
 
 export interface Recording {
   id: string;
-  user_id: string;
   title: string | null;
   generated_title: string | null;
   filename: string;
+  original_filename: string | null;
+  output_path: string | null;
   content_type: string | null;
   language: string | null;
   duration_sec: number | null;
@@ -57,6 +47,7 @@ export interface HealthResponse {
   transcription_model: string;
   summary_url: string;
   summary_model: string;
+  summary_provider: "api" | "codex";
 }
 
 export interface Settings {
@@ -75,12 +66,14 @@ export interface Settings {
   vad_chunk_max_sec: number;
   summary_url: string;
   summary_key: string;
+  summary_codex_model: string;
+  summary_codex_timeout: number;
   summary_model: string;
+  summary_provider: "api" | "codex";
   job_poll_interval: number;
-  auth_access_ttl_minutes: number;
-  auth_refresh_ttl_days: number;
-  auth_min_password_len: number;
-  admin_usernames: string[];
+  watch_enabled: boolean;
+  watch_poll_interval: number;
+  watch_stable_seconds: number;
   trim_enabled: boolean;
   trim_threshold: number;
   trim_min_silence: number;
@@ -91,40 +84,6 @@ export interface Settings {
 }
 
 export type SettingsUpdate = Partial<Settings>;
-
-export interface AdminUser {
-  id: string;
-  username: string;
-  tier: string;
-  usage_minutes: number;
-}
-
-export interface TierUpdate {
-  tier: "free" | "standard" | "pro";
-}
-
-export interface AuthTokens {
-  token: string;
-  refresh_token: string;
-}
-
-export interface RefreshRequest {
-  refresh_token: string;
-}
-
-export interface LogoutRequest {
-  refresh_token: string;
-}
-
-export interface RegisterRequest {
-  username: string;
-  password: string;
-}
-
-export interface LoginRequest {
-  username: string;
-  password: string;
-}
 
 export interface UploadRequest {
   audio: File;

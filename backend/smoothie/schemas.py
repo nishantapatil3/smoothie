@@ -39,6 +39,8 @@ class RecordingListItem(BaseModel):
 
 class RecordingDetail(RecordingListItem):
     filename: str
+    original_filename: str | None = None
+    output_path: str | None = None
     content_type: str | None
     full_text: str = ""
     segments: list[SegmentOut] = Field(default_factory=list)
@@ -54,3 +56,4 @@ class HealthOut(BaseModel):
     transcription_model: str
     summary_url: str
     summary_model: str
+    summary_provider: str

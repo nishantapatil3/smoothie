@@ -277,11 +277,7 @@ function TranscriptView() {
             )}
           </div>
         ) : recording.status === "failed" ? (
-          /limit/i.test(recording.error || "") ? (
-            <div className="error box mt-2">
-              Transcription limit reached. Free tier allows 30 minutes — upgrade to Standard or Pro to continue.
-            </div>
-          ) : /too short/i.test(recording.error || "") ? (
+          /too short/i.test(recording.error || "") ? (
             <div className="error box mt-2">
               Audio is too short to transcribe. Record at least a second of speech and try again.
             </div>

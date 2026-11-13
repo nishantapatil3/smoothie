@@ -59,24 +59,6 @@ summarization_retries = Counter(
     "Total number of summarization retries",
 )
 
-# User metrics
-active_users = Gauge(
-    "smoothie_active_users",
-    "Number of active users",
-)
-
-user_tier = Gauge(
-    "smoothie_user_tier",
-    "User tier (0=free, 1=standard, 2=pro)",
-    ["username"],
-)
-
-user_usage_minutes = Gauge(
-    "smoothie_user_usage_minutes",
-    "User transcription usage in minutes",
-    ["username", "tier"],
-)
-
 # Error metrics
 errors_total = Counter(
     "smoothie_errors_total",

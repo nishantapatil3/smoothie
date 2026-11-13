@@ -17,11 +17,11 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .db import async_session, init_db
-from .models import Job, JobStage, Recording, Summary, Transcript, User
-from .storage import delete_audio
+from .models import Job, JobStage, Recording, Summary, Transcript
+from .storage import audio_path
+from .artifacts import commit_recording
 from .summarize import SummaryError, get_provider
 from .transcription import TranscriptionError, transcribe, warm_model
-from .tiers import can_transcribe
 from .metrics import (
     jobs_total,
     job_duration_seconds,
@@ -96,11 +96,18 @@ async def _recover_orphans() -> None:
         )
         jobs = (await session.execute(stmt)).scalars().all()
         for job in jobs:
-            job.stage = JobStage.PENDING
-            job.progress = 0.0
-            rec = await session.get(Recording, job.recording_id)
+            rec = await session.get(
+                Recording, job.recording_id, options=[selectinload(Recording.transcript)]
+            )
+            resume_summary = (
+                job.stage == JobStage.SUMMARIZING and rec is not None
+                and rec.transcript is not None
+            )
+            job.stage = JobStage.SUMMARIZING if resume_summary else JobStage.PENDING
+            job.progress = 1.0 if resume_summary else 0.0
             if rec is not None:
-                rec.status = JobStage.PENDING
+                rec.status = job.stage
+                await commit_recording(session, rec)
         if jobs:
             await session.commit()
             logger.info("Recovered %d orphaned job(s) to PENDING.", len(jobs))
@@ -134,40 +141,7 @@ async def _process_one() -> None:
             await session.commit()
             return
 
-        # --- Enforce tier limits (lifetime transcription budget) ---
-        # Gate compute here (not at upload) per the chosen design: uploads are
-        # always accepted, but a free user whose 30-minute budget is exhausted
-        # has the job marked FAILED with a clear upgrade message.
-        owner = await session.get(User, recording.user_id)
-        tier_value = owner.tier if owner is not None else "free"
-        usage_minutes = float(owner.usage_minutes) if owner is not None else 0.0
-        allowed, used, limit = can_transcribe(tier_value, usage_minutes)
-        if not allowed:
-            # Capture plain ids before rolling back the claim transaction; the
-            # rolled-back session detaches `job`/`recording`, so accessing their
-            # ORM attributes later would raise MissingGreenlet on async SQLite.
-            job_id = job.id
-            recording_id = recording.id
-            await session.rollback()
-            async with async_session() as s2:
-                j = await s2.get(Job, job_id)
-                if j is not None:
-                    j.stage = JobStage.FAILED
-                    j.error = (
-                        "Transcription limit reached: your free tier allows "
-                        f"{int(limit)} minutes of transcription. Upgrade to "
-                        "Standard or Pro to continue."
-                    )
-                    rec = await s2.get(Recording, recording_id)
-                    if rec is not None:
-                        rec.status = JobStage.FAILED
-                    await s2.commit()
-            logger.info(
-                "Job %s blocked: %s tier exceeded %d-min budget.",
-                job_id, tier_value, int(limit),
-            )
-            return
-
+        job_id, recording_id = job.id, recording.id
         try:
             # --- Summarize-only resume ---
             # If transcription already succeeded (a transcript exists) but the
@@ -184,9 +158,9 @@ async def _process_one() -> None:
                 # --- Transcribe ---
                 job.stage = JobStage.TRANSCRIBING
                 recording.status = JobStage.TRANSCRIBING
-                await session.commit()
+                await commit_recording(session, recording)
 
-                path = str(_audio_path_for(recording.filename))
+                path = str(audio_path(recording.filename, recording.output_path))
                 transcribe_start = time.monotonic()
                 # whisper.cpp transcription is blocking; run it off the event loop
                 # via asyncio.to_thread. Its progress callback is invoked from
@@ -205,11 +179,11 @@ async def _process_one() -> None:
 
                     async def _persist() -> None:
                         async with async_session() as s:
-                            j = await s.get(Job, job.id)
+                            j = await s.get(Job, job_id)
                             if j:
                                 j.progress = progress
                                 await s.commit()
-                        notify_progress(job.id)
+                        notify_progress(job_id)
 
                     asyncio.run_coroutine_threadsafe(_persist(), loop)
 
@@ -220,9 +194,9 @@ async def _process_one() -> None:
 
                 # Check if job was cancelled during transcription
                 async with async_session() as s:
-                    j = await s.get(Job, job.id)
+                    j = await s.get(Job, job_id)
                     if j and j.cancelled:
-                        logger.info("Job %s was cancelled during transcription", job.id)
+                        logger.info("Job %s was cancelled during transcription", job_id)
                         return
 
                 # Record transcription metrics
@@ -232,24 +206,20 @@ async def _process_one() -> None:
                     audio_duration_seconds.observe(recording.duration_sec)
 
                 transcript = recording.transcript or Transcript(
-                    recording_id=recording.id
+                    recording_id=recording_id
                 )
                 transcript.full_text = result.text
                 transcript.segments = result.segments
                 session.add(transcript)
                 recording.duration_sec = _duration_from(result.segments)
                 job.progress = 1.0  # transcription complete
-                # Account the consumed transcription time against the lifetime
-                # budget. Truncate to whole minutes so the meter is predictable.
-                if owner is not None:
-                    owner.usage_minutes += int((recording.duration_sec or 0) // 60)
-                await session.commit()
+                await commit_recording(session, recording)
                 summary_text_in = result.text
 
             # --- Summarize ---
             job.stage = JobStage.SUMMARIZING
             recording.status = JobStage.SUMMARIZING
-            await session.commit()
+            await commit_recording(session, recording)
 
             summarize_start = time.monotonic()
             provider = get_provider()
@@ -259,7 +229,7 @@ async def _process_one() -> None:
             # Record summarization metrics
             summarization_duration_seconds.observe(summarize_duration)
 
-            summary = recording.summary or Summary(recording_id=recording.id)
+            summary = recording.summary or Summary(recording_id=recording_id)
             summary.markdown = result.summary
             summary.provider = provider.name
             session.add(summary)
@@ -274,7 +244,7 @@ async def _process_one() -> None:
             job.stage = JobStage.COMPLETED
             recording.status = JobStage.COMPLETED
             job.error = None
-            await session.commit()
+            await commit_recording(session, recording)
 
             # Record successful job metrics
             jobs_total.labels(stage="total", status="completed").inc()
@@ -283,47 +253,56 @@ async def _process_one() -> None:
             )
 
         except SummaryError as exc:
-            logger.error("Summarization failed for job %s: %s", job.id, exc)
+            logger.error("Summarization failed for job %s: %s", job_id, exc)
             summarization_retries.inc()
             errors_total.labels(component="summarizer", error_type="summarization_error").inc()
             await session.rollback()
             async with async_session() as s2:
-                j = await s2.get(Job, job.id)
+                j = await s2.get(Job, job_id)
                 if j is not None:
                     j.stage = JobStage.FAILED
                     j.error = str(exc)[:2000]
-                    rec = await s2.get(Recording, recording.id)
+                    rec = await s2.get(Recording, recording_id)
                     if rec is not None:
                         rec.status = JobStage.FAILED
-                    await s2.commit()
+                    if rec is not None:
+                        await commit_recording(s2, rec)
+                    else:
+                        await s2.commit()
             jobs_total.labels(stage="summarizing", status="failed").inc()
         except TranscriptionError as exc:
-            logger.error("Transcription failed for job %s: %s", job.id, exc)
+            logger.error("Transcription failed for job %s: %s", job_id, exc)
             errors_total.labels(component="transcriber", error_type="transcription_error").inc()
             await session.rollback()
             async with async_session() as s2:
-                j = await s2.get(Job, job.id)
+                j = await s2.get(Job, job_id)
                 if j is not None:
                     j.stage = JobStage.FAILED
                     j.error = str(exc)[:2000]
-                    rec = await s2.get(Recording, recording.id)
+                    rec = await s2.get(Recording, recording_id)
                     if rec is not None:
                         rec.status = JobStage.FAILED
-                    await s2.commit()
+                    if rec is not None:
+                        await commit_recording(s2, rec)
+                    else:
+                        await s2.commit()
             jobs_total.labels(stage="transcribing", status="failed").inc()
         except Exception as exc:  # noqa: BLE001
-            logger.error("Job %s failed: %s", job.id, exc)
+            logger.error("Job %s failed: %s", job_id, exc)
             errors_total.labels(component="worker", error_type="other").inc()
             await session.rollback()
             async with async_session() as s2:
-                j = await s2.get(Job, job.id)
+                j = await s2.get(Job, job_id)
                 if j is not None:
                     j.stage = JobStage.FAILED
                     j.error = str(exc)[:2000]
-                    rec = await s2.get(Recording, recording.id)
+                    rec = await s2.get(Recording, recording_id)
                     if rec is not None:
                         rec.status = JobStage.FAILED
-                    await s2.commit()
+                    if rec is not None:
+                        await commit_recording(s2, rec)
+                    else:
+                        await s2.commit()
             jobs_total.labels(stage="unknown", status="failed").inc()
 
 
@@ -353,12 +332,6 @@ async def _load_recording(session: AsyncSession, recording_id: str) -> Recording
     return result.scalar_one_or_none()
 
 
-def _audio_path_for(filename: str) -> Path:
-    from .storage import audio_path
-
-    return audio_path(filename)
-
-
 def _duration_from(segments: list[dict]) -> float | None:
     if not segments:
         return None
@@ -377,10 +350,13 @@ async def reprocess(recording_id: str) -> None:
             return
         job.stage = JobStage.PENDING
         job.error = None
+        job.progress = 0.0
+        job.cancelled = False
+        job.cancelled_at = None
         recording = await session.get(Recording, recording_id)
         if recording is not None:
             recording.status = JobStage.PENDING
-        await session.commit()
+        await commit_recording(session, recording)
 
 
 async def retry_summary(recording_id: str) -> bool:
@@ -412,8 +388,10 @@ async def retry_summary(recording_id: str) -> bool:
             return False
         job.stage = JobStage.SUMMARIZING
         job.error = None
+        job.cancelled = False
+        job.cancelled_at = None
         recording.status = JobStage.SUMMARIZING
-        await session.commit()
+        await commit_recording(session, recording)
         return True
 
 
@@ -446,5 +424,5 @@ async def regenerate_title(recording_id: str) -> str | None:
         # Keep an empty result from clobbering an existing good title.
         if title:
             recording.generated_title = title[:255]
-            await session.commit()
+            await commit_recording(session, recording)
         return title or None

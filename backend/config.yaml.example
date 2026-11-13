@@ -4,10 +4,7 @@
 # `config.yaml` (same directory) and adjust. The web UI Settings page edits
 # these values at runtime and writes them back here.
 #
-# `data_dir`, `ffmpeg_bin`, and `auth_secret` are NOT exposed in the UI:
-#   - data_dir / ffmpeg_bin affect where the live database lives.
-#   - auth_secret signs tokens; set it here to a stable random value
-#     (e.g. output of `openssl rand -hex 32`) so tokens survive restarts.
+# `data_dir` and `ffmpeg_bin` are configured here, not through the web UI.
 
 # --- Server ---
 host: 0.0.0.0
@@ -16,6 +13,16 @@ port: 5173
 # --- Storage ---
 # Directory where the sqlite db and uploaded audio live.
 data_dir: data
+
+# --- Folder ingestion ---
+# Relative paths are resolved from the repository root, not the working directory.
+# These directories are created automatically. Originals are never moved/deleted.
+watch_dir: watch
+output_dir: output
+watch_enabled: true
+watch_poll_interval: 2.0
+# Wait for unchanged size + modification time before copying.
+watch_stable_seconds: 5.0
 
 # --- Transcription provider (whisper.cpp, local) ---
 # Model name (tiny/base/small/medium/large-v3), quantized name, or local .bin file.
@@ -36,7 +43,15 @@ vad_speech_pad_ms: 200
 vad_chunk_target_sec: 24
 vad_chunk_max_sec: 30
 
-# --- Summary provider (OpenAI-compatible /chat/completions endpoint) ---
+# --- Summary provider ---
+# api: OpenAI-compatible endpoint; codex: this machine's Codex ChatGPT login.
+summary_provider: api
+# For codex: blank uses the installed CLI's default model. No API key required.
+summary_codex_model: ""
+summary_codex_timeout: 300.0
+codex_bin: ""  # auto-detected on PATH; configured here, not through the UI
+codex_home: ~/.codex  # CLI manages auth.json here; never copy its contents here
+
 # Point at any summarizer LLM — local or remote. Default is a local
 # OpenAI-compatible server (e.g. Ollama at its /v1 port).
 summary_url: http://localhost:11434/v1
@@ -46,19 +61,6 @@ summary_model: llama3.2
 
 # --- Worker ---
 job_poll_interval: 2.0
-
-# --- Auth ---
-# Secret signing Bearer access tokens (HMAC). Set a stable random value.
-auth_secret: ""
-auth_access_ttl_minutes: 60
-auth_refresh_ttl_days: 7
-auth_min_password_len: 8
-
-# --- Tier administration ---
-# Usernames allowed to list users and change their subscription tier via the
-# admin API/UI. Empty = no one can change tiers (free-tier limits still apply).
-# Add your username here to manage tiers, e.g. ["admin"].
-admin_usernames: []
 
 # --- Pre-audio-processing (pluggable modules) ---
 ffmpeg_bin: ""  # auto-detected via shutil.which if empty

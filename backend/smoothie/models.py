@@ -5,7 +5,6 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-import structlog
 from sqlalchemy import (
     DateTime,
     Enum,
@@ -32,58 +31,6 @@ def _uuid() -> str:
     return uuid.uuid4().hex
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    username: Mapped[str] = mapped_column(
-        String(64), nullable=False, unique=True, index=True
-    )
-    # bcrypt hash (or other passlib-compatible scheme) of the password.
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    # Subscription tier ("free" | "standard" | "pro"). Drives usage limits and
-    # feature availability; see smoothie/tiers.py.
-    tier: Mapped[str] = mapped_column(String(16), nullable=False, default="free")
-    # Lifetime transcription minutes consumed. Compared against the tier's cap
-    # in tiers.py; never resets (free tier is a one-time budget).
-    usage_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now
-    )
-
-    recordings: Mapped[list["Recording"]] = relationship(
-        back_populates="owner",
-        cascade="all, delete-orphan",
-    )
-
-
-class RefreshToken(Base):
-    """Stored refresh token (only its hash is persisted, never the raw value).
-
-    Rotated on every use: a refresh swaps in a new token and revokes the old
-    one. Lets sessions be revoked (logout) and limits the blast radius of a
-    leaked token.
-    """
-
-    __tablename__ = "refresh_tokens"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    # SHA-256 hex of the opaque refresh token issued to the client.
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now
-    )
-
-
 class JobStage(str, enum.Enum):
     PENDING = "pending"
     TRANSCRIBING = "transcribing"
@@ -97,18 +44,17 @@ class Recording(Base):
     __tablename__ = "recordings"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Short LLM-generated title (3-4 words) derived from the transcript after
     # summarization. Kept separate from `title` so a name the user typed at
     # upload is never overwritten; the web UI shows this when present.
     generated_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    original_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Absolute per-recording directory; NULL retains legacy data/audio storage.
+    output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    artifacts_dirty: Mapped[bool] = mapped_column(default=True, nullable=False)
+    artifact_revision: Mapped[int] = mapped_column(default=0, nullable=False)
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     duration_sec: Mapped[float | None] = mapped_column(nullable=True)
@@ -117,7 +63,6 @@ class Recording(Base):
         Enum(JobStage), default=JobStage.PENDING, nullable=False
     )
 
-    owner: Mapped["User"] = relationship(back_populates="recordings")
     transcript: Mapped["Transcript | None"] = relationship(
         back_populates="recording",
         uselist=False,
@@ -148,6 +93,27 @@ class Transcript(Base):
     segments: Mapped[list] = mapped_column(JSON, default=list)
 
     recording: Mapped[Recording] = relationship(back_populates="transcript")
+
+
+class FolderImport(Base):
+    """Durable file claims, retained after a recording is deleted to avoid reimport."""
+
+    __tablename__ = "folder_imports"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    # Hash of source path, size, and mtime_ns: stable across application restarts.
+    source_key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    source_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_size: Mapped[int] = mapped_column(nullable=False)
+    source_mtime_ns: Mapped[int] = mapped_column(nullable=False)
+    output_path: Mapped[str] = mapped_column(Text, nullable=False)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), default="copying", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recording_id: Mapped[str | None] = mapped_column(
+        ForeignKey("recordings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class Summary(Base):

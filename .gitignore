@@ -17,6 +17,10 @@ htmlcov/
 # Backend data (db + uploaded audio)
 backend/data/
 
+# Folder ingestion sources and generated job artifacts
+/watch/
+/output/
+
 # Env / secrets
 # config.yaml holds runtime settings + secrets (summary_key, auth_secret).
 # The example template is committed; the real file is git-ignored.

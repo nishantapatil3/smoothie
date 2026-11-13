@@ -182,6 +182,13 @@ class ApiEndpointProvider(SummaryProvider):
 
 def get_provider() -> SummaryProvider:
     settings = get_settings()
+    if settings.summary_provider == "codex":
+        from .codex_summarize import CodexProvider
+
+        return CodexProvider(
+            settings.codex_bin, settings.codex_home,
+            settings.summary_codex_model, settings.summary_codex_timeout,
+        )
     return ApiEndpointProvider(
         settings.summary_url,
         settings.summary_model,

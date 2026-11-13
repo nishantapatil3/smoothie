@@ -69,18 +69,6 @@ body {
   @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
 }
 
-.badge-free {
-  @apply bg-gray-100 text-gray-800;
-}
-
-.badge-standard {
-  @apply bg-blue-100 text-blue-800;
-}
-
-.badge-pro {
-  @apply bg-purple-100 text-purple-800;
-}
-
 .progress {
   @apply h-2 w-full overflow-hidden rounded-full bg-gray-100;
 }
